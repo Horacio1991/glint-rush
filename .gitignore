@@ -1,0 +1,9 @@
+.godot/
+android/build/
+*.apk
+*.aab
+backend_config.cfg
+android/auth-plugin/.gradle/
+android/auth-plugin/build/
+supabase/.temp/
+supabase/.branches/

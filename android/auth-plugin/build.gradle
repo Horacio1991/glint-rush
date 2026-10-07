@@ -1,0 +1,24 @@
+plugins {
+    id 'com.android.library' version '8.6.1'
+}
+
+android {
+    namespace 'com.glint_rush.auth'
+    compileSdk 35
+    defaultConfig { minSdk 23 }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    compileOnly 'org.godotengine:godot:4.3.0.stable'
+}
+
+tasks.register('copyReleaseAar', Copy) {
+    dependsOn 'assembleRelease'
+    from(layout.buildDirectory.file("outputs/aar/${project.name}-release.aar"))
+    into('../../addons/glintrush_auth/bin')
+    rename { 'glintrush-auth.aar' }
+}
