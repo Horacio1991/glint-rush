@@ -180,9 +180,13 @@ var sfx_players: Array[AudioStreamPlayer] = []
 var sfx_cursor := 0
 var music_player: AudioStreamPlayer
 var title_button_rect := Rect2()
+var title_leaderboard_rect := Rect2()
 var auth_button_rect := Rect2()
 var logout_button_rect := Rect2()
 var again_button_rect := Rect2()
+var result_menu_rect := Rect2()
+var leaderboard_back_rect := Rect2()
+var leaderboard_refresh_rect := Rect2()
 var button_pressed := false
 var dialog_kind := ""
 var dialog_started_msec := 0
@@ -193,6 +197,14 @@ var exit_button_rect := Rect2()
 var title_exit_button_rect := Rect2()
 var round_generation := 0
 var swap_tween: Tween
+var round_submission_match_id := ""
+var round_submission_state := "local"
+var round_submission_detail := "Partida local; iniciá sesión para clasificar."
+var leaderboard_entries: Array[Dictionary] = []
+var leaderboard_loading := false
+var leaderboard_message := ""
+var leaderboard_season_key := ""
+var leaderboard_request_generation := 0
 
 
 func _ready() -> void:
@@ -222,6 +234,8 @@ func _ready() -> void:
 	music_player.stream = music_stream
 	best_score = _load_best()
 	AuthService.auth_state_changed.connect(_on_auth_state_changed)
+	OnlineService.score_submission_updated.connect(_on_score_submission_updated)
+	OnlineService.leaderboard_loaded.connect(_on_leaderboard_loaded)
 	set_process(true)
 	queue_redraw()
 
@@ -238,6 +252,8 @@ func _notification(what: int) -> void:
 func _handle_back_navigation() -> void:
 	if dialog_kind != "":
 		_close_dialog()
+	elif game_state == "leaderboard" or game_state == "result":
+		_return_to_menu()
 	elif game_state != "title":
 		_open_dialog("exit")
 
@@ -319,6 +335,8 @@ func _draw() -> void:
 		_draw_final_blast_overlay()
 	elif game_state == "result":
 		_draw_result()
+	elif game_state == "leaderboard":
+		_draw_leaderboard()
 	if transition_alpha > 0.01:
 		draw_rect(Rect2(Vector2.ZERO, size), Color(0.64, 0.91, 1.0, transition_alpha * 0.24))
 	_draw_confirmation_dialog()
@@ -355,7 +373,7 @@ func _pointer_start(pos: Vector2) -> void:
 	pointer_cell = _cell_at(pos)
 	pointer_dragging = false
 	pointer_swap_started = false
-	button_pressed = (game_state == "title" and (title_button_rect.has_point(pos) or title_exit_button_rect.has_point(pos) or logout_button_rect.has_point(pos))) or (game_state == "result" and again_button_rect.has_point(pos)) or (game_state == "playing" and (restart_button_rect.has_point(pos) or exit_button_rect.has_point(pos)))
+	button_pressed = (game_state == "title" and (title_button_rect.has_point(pos) or title_leaderboard_rect.has_point(pos) or auth_button_rect.has_point(pos) or title_exit_button_rect.has_point(pos) or logout_button_rect.has_point(pos))) or (game_state == "result" and (again_button_rect.has_point(pos) or result_menu_rect.has_point(pos))) or (game_state == "leaderboard" and (leaderboard_back_rect.has_point(pos) or leaderboard_refresh_rect.has_point(pos))) or (game_state == "playing" and (restart_button_rect.has_point(pos) or exit_button_rect.has_point(pos)))
 	queue_redraw()
 
 
@@ -396,12 +414,22 @@ func _pointer_end(pos: Vector2) -> void:
 			AuthService.logout()
 		elif title_button_rect.has_point(pos):
 			_start_game()
+		elif title_leaderboard_rect.has_point(pos):
+			_open_leaderboard()
 		elif title_exit_button_rect.has_point(pos):
 			_open_dialog("exit")
 		return
 	if game_state == "result":
 		if again_button_rect.has_point(pos):
 			_start_game()
+		elif result_menu_rect.has_point(pos):
+			_return_to_menu()
+		return
+	if game_state == "leaderboard":
+		if leaderboard_back_rect.has_point(pos):
+			_return_to_menu()
+		elif leaderboard_refresh_rect.has_point(pos):
+			_open_leaderboard()
 		return
 	if game_state == "playing" and restart_button_rect.has_point(pos):
 		_open_dialog("restart")
@@ -1251,6 +1279,9 @@ func _finish_round() -> void:
 		_save_best(best_score)
 	transition_alpha = 0.72
 	_play_sfx("finish", 0.9, 2.0)
+	round_submission_match_id = client_match_id
+	round_submission_state = "local"
+	round_submission_detail = "Partida local; iniciá sesión para clasificar."
 	round_finished.emit(client_match_id, score, ONLINE_CONTRACT.GAME_VERSION, ONLINE_CONTRACT.ONLINE_PROTOCOL_VERSION, match_session_id)
 	queue_redraw()
 
@@ -1508,7 +1539,12 @@ func _draw_title() -> void:
 		_draw_text_center(status_line, size.y * 0.727, 13, Color("bfd5f6"))
 	title_button_rect = Rect2((size.x - w) * 0.5, size.y * 0.752, w, 86)
 	_draw_button(title_button_rect, "JUGAR", Color("39e9ff"), Color("2135a7"), 35)
-	title_exit_button_rect = Rect2((size.x - 240.0) * 0.5, size.y * 0.862, 240.0, 46.0)
+	var menu_action_width := minf(w, 430.0)
+	var menu_action_button_width := (menu_action_width - 12.0) * 0.5
+	var menu_action_x := (size.x - menu_action_width) * 0.5
+	title_leaderboard_rect = Rect2(menu_action_x, size.y * 0.862, menu_action_button_width, 50.0)
+	_draw_button(title_leaderboard_rect, "RANKING SEMANAL", Color("ffd876"), Color("5c347e"), 16)
+	title_exit_button_rect = Rect2(title_leaderboard_rect.end.x + 12.0, size.y * 0.862, menu_action_button_width, 50.0)
 	_draw_button(title_exit_button_rect, "SALIR", Color("645778"), Color("29223f"), 18)
 	_draw_text_center("RÉCORD PERSONAL  " + _format_score(best_score), size.y * 0.925, 20, Color("ffe88c"), true)
 	_draw_text_center("UNA PARTIDA. 60 SEGUNDOS. TODO PUEDE PASAR.", size.y * 0.975, 13, Color("a8bce8"))
@@ -2203,7 +2239,155 @@ func _draw_result() -> void:
 	var w := minf(size.x - 100.0, 430.0)
 	again_button_rect = Rect2((size.x - w) * 0.5, size.y * 0.665, w, 90)
 	_draw_button(again_button_rect, "JUGAR DE NUEVO", Color("12dfff"), Color("143c9b"))
-	_draw_text_center("UNA MÁS. ESTA VEZ SALE LA CASCADA.", size.y * 0.81, 17, Color("a7bce9"))
+	var status_color := Color("aefbe4") if round_submission_state == "saved" else (Color("ffcf8b") if round_submission_state == "pending" else Color("b9cce9"))
+	_draw_text_center(round_submission_detail, size.y * 0.785, 14, status_color)
+	result_menu_rect = Rect2((size.x - w) * 0.5, size.y * 0.82, w, 64.0)
+	_draw_button(result_menu_rect, "VOLVER AL MENÚ", Color("a96dff"), Color("39276f"), 23)
+	_draw_text_center("UNA MÁS. ESTA VEZ SALE LA CASCADA.", size.y * 0.91, 15, Color("a7bce9"))
+
+
+func _return_to_menu() -> void:
+	round_generation += 1
+	leaderboard_request_generation += 1
+	if swap_tween != null and swap_tween.is_valid():
+		swap_tween.kill()
+	swap_visual_active = false
+	game_state = "title"
+	input_locked = false
+	resolving = false
+	timed_out = false
+	final_blast_active = false
+	final_blast_started = false
+	deadline_msec = 0
+	seconds_left = float(CONFIG["ROUND_SECONDS"])
+	selected = Vector2i(-1, -1)
+	pointer_down = false
+	pointer_dragging = false
+	pointer_swap_started = false
+	pointer_cell = Vector2i(-1, -1)
+	dialog_kind = ""
+	board.clear()
+	specials.clear()
+	clear_visuals.clear()
+	fall_visuals.clear()
+	special_visuals.clear()
+	creation_visuals.clear()
+	particles.clear()
+	floaters.clear()
+	idle_glints.clear()
+	music_player.stop()
+	transition_alpha = 0.62
+	queue_redraw()
+
+
+func _open_leaderboard() -> void:
+	game_state = "leaderboard"
+	input_locked = true
+	leaderboard_entries.clear()
+	leaderboard_season_key = ""
+	leaderboard_loading = true
+	leaderboard_message = "CARGANDO CLASIFICACIÓN…"
+	leaderboard_request_generation += 1
+	OnlineService.fetch_weekly_leaderboard(20, leaderboard_request_generation)
+	queue_redraw()
+
+
+func _on_score_submission_updated(match_id: String, state: String, detail: String) -> void:
+	if game_state != "result" or match_id != round_submission_match_id:
+		return
+	round_submission_state = state
+	round_submission_detail = detail
+	queue_redraw()
+
+
+func _on_leaderboard_loaded(request_generation: int, success: bool, data: Variant, message: String) -> void:
+	if game_state != "leaderboard" or request_generation != leaderboard_request_generation:
+		return
+	leaderboard_loading = false
+	leaderboard_message = message
+	leaderboard_entries.clear()
+	if not success:
+		queue_redraw()
+		return
+	if not data is Array:
+		leaderboard_message = "No se pudo cargar el ranking. Probá de nuevo."
+		queue_redraw()
+		return
+	for item in data:
+		if not item is Dictionary:
+			continue
+		var entry := {
+			"position": maxi(1, int(item.get("position", 0))),
+			"handle": str(item.get("handle", "jugador")),
+			"best_score": maxi(0, int(item.get("best_score", 0))),
+			"is_me": bool(item.get("is_me", false)),
+			"season_key": str(item.get("season_key", "")),
+		}
+		leaderboard_entries.append(entry)
+		if leaderboard_season_key.is_empty():
+			leaderboard_season_key = str(item.get("season_key", ""))
+	if leaderboard_entries.is_empty():
+		leaderboard_message = "Todavía no hay puntuaciones esta semana. ¡Sé el primero!"
+	else:
+		leaderboard_message = ""
+	queue_redraw()
+
+
+func _draw_leaderboard() -> void:
+	var t := Time.get_ticks_msec() * 0.001
+	draw_rect(Rect2(Vector2.ZERO, size), Color(0.006, 0.012, 0.055, 0.72))
+	draw_circle(Vector2(size.x * 0.5, size.y * 0.35), size.x * 0.46, Color(0.12, 0.35, 0.88, 0.08 + 0.025 * sin(t * 1.4)))
+	_draw_arcade_title_text("RANKING", size.y * 0.13, 46, Color("fff0aa"), Color("5eeaff"))
+	var season_label := "TEMPORADA SEMANAL"
+	if not leaderboard_season_key.is_empty():
+		season_label = "TEMPORADA " + leaderboard_season_key
+	_draw_text_center(season_label, size.y * 0.17, 16, Color("bedcff"))
+	var panel := Rect2(24.0, size.y * 0.195, size.x - 48.0, size.y * 0.62)
+	draw_style_box(ui_board_style, panel)
+	_draw_ornamental_frame(panel, Color("d7b66e"), 8.0)
+	var header_y := panel.position.y + 39.0
+	draw_string(ThemeDB.fallback_font, Vector2(panel.position.x + 22.0, header_y), "POS", HORIZONTAL_ALIGNMENT_LEFT, 65.0, 14, Color("e9cc8c"))
+	draw_string(ThemeDB.fallback_font, Vector2(panel.position.x + 92.0, header_y), "JUGADOR", HORIZONTAL_ALIGNMENT_LEFT, panel.size.x * 0.48, 14, Color("e9cc8c"))
+	draw_string(ThemeDB.fallback_font, Vector2(panel.position.x + 16.0, header_y), "PUNTOS", HORIZONTAL_ALIGNMENT_RIGHT, panel.size.x - 34.0, 14, Color("e9cc8c"))
+	if leaderboard_loading:
+		_draw_text_center(leaderboard_message, panel.get_center().y, 20, Color("bdeaff"), true)
+	elif not leaderboard_message.is_empty():
+		_draw_text_center(leaderboard_message, panel.get_center().y, 17, Color("c6d6f2"))
+	else:
+		var row_y := panel.position.y + 52.0
+		var row_height := 30.0
+		var shown := 0
+		var player_outside := {}
+		var player_in_top := false
+		for entry in leaderboard_entries:
+			var position := int(entry["position"])
+			if position > 20:
+				if bool(entry["is_me"]):
+					player_outside = entry
+				continue
+			if bool(entry["is_me"]):
+				player_in_top = true
+			var row := Rect2(panel.position.x + 10.0, row_y + shown * row_height, panel.size.x - 20.0, row_height - 1.0)
+			if bool(entry["is_me"]):
+				draw_rect(row, Color(0.07, 0.48, 0.79, 0.38), true)
+				draw_rect(row, Color("62eaff"), false, 1.1, true)
+			var color := Color("fff0a3") if position == 1 else (Color("f1d69c") if position <= 3 else Color("dce9ff"))
+			draw_string(ThemeDB.fallback_font, Vector2(row.position.x + 10.0, row.position.y + 20.0), str(position), HORIZONTAL_ALIGNMENT_LEFT, 52.0, 15, color)
+			draw_string(ThemeDB.fallback_font, Vector2(row.position.x + 74.0, row.position.y + 20.0), "@" + str(entry["handle"]), HORIZONTAL_ALIGNMENT_LEFT, panel.size.x * 0.48, 15, color)
+			draw_string(ThemeDB.fallback_font, Vector2(row.position.x + 8.0, row.position.y + 20.0), _format_score(int(entry["best_score"])), HORIZONTAL_ALIGNMENT_RIGHT, row.size.x - 18.0, 15, color)
+			shown += 1
+		if not player_outside.is_empty():
+			var self_rect := Rect2(32.0, size.y * 0.835, size.x - 64.0, 53.0)
+			draw_style_box(ui_hud_style, self_rect)
+			_draw_ornamental_frame(self_rect, Color("61e7ff"), 5.0)
+			draw_string(ThemeDB.fallback_font, Vector2(self_rect.position.x + 12.0, self_rect.position.y + 22.0), "TU POSICIÓN  " + str(player_outside["position"]) + "º", HORIZONTAL_ALIGNMENT_LEFT, self_rect.size.x * 0.52, 15, Color("7deeff"))
+			draw_string(ThemeDB.fallback_font, Vector2(self_rect.position.x + 8.0, self_rect.position.y + 22.0), "@" + str(player_outside["handle"]) + "  ·  " + _format_score(int(player_outside["best_score"])), HORIZONTAL_ALIGNMENT_RIGHT, self_rect.size.x - 22.0, 15, Color("f5edbf"))
+		elif not player_in_top:
+			_draw_text_center("TU POSICIÓN  ·  AÚN NO CLASIFICASTE ESTA SEMANA", size.y * 0.865, 14, Color("b9d7ff"))
+	leaderboard_back_rect = Rect2(32.0, size.y * 0.91, size.x * 0.43, 62.0)
+	leaderboard_refresh_rect = Rect2(size.x * 0.54, size.y * 0.91, size.x * 0.42, 62.0)
+	_draw_button(leaderboard_back_rect, "VOLVER", Color("77729d"), Color("353451"), 21)
+	_draw_button(leaderboard_refresh_rect, "ACTUALIZAR", Color("30d8ff"), Color("173a8d"), 18)
 
 
 func _draw_button(rect: Rect2, label: String, top: Color, bottom: Color, font_size: int = 35) -> void:

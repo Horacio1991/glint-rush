@@ -1,64 +1,41 @@
-# Contrato online de GLINT RUSH (Fases 1–3)
+# Contrato online de GLINT RUSH
 
-## Alcance de esta versión
+## Estado actual
 
-Este documento fija el límite entre el juego local y futuros servicios online. La partida sigue siendo local y offline-first. `OnlineService` no realiza login, no crea tickets de partida, no envía resultados y no sustituye el ranking de demostración. No existen todavía perfiles creados automáticamente ni un endpoint que acepte scores.
-
-La base SQL sí reserva las tablas y permisos para las siguientes fases. `get_current_season()` es el único RPC funcional de esta etapa.
+La Fase 6 conecta el final de partidas autenticadas con Supabase y agrega una consulta de ranking semanal. El juego sigue siendo offline-first: gameplay, timer, cascadas, SPEED, especiales, Final Blast, revancha y récord local no dependen de HTTP. No hay matchmaking, PvP realtime, amigos operativos, compras ni anuncios.
 
 ## Responsabilidades
 
-- `scripts/game.gd`: gameplay, tablero, timer, puntuación, récord local, clasificación simulada y presentación. No hace consultas HTTP ni espera al backend.
-- `scripts/online_contract.gd`: `GAME_VERSION`, `ONLINE_PROTOCOL_VERSION` y generación del `client_match_id`.
-- `scripts/services/online_service.gd` (autoload `OnlineService`): configuración de URL/clave pública, peticiones HTTP JSON genéricas y no bloqueantes, timeout, reintentos acotados, estado y errores de transporte. No contiene reglas del juego.
-- `supabase/migrations/`: esquema SQL, constraints, índices, permisos y RLS.
+- `scripts/game.gd`: reglas, estado visual, transición resultados→menú y pantalla de ranking. No contiene peticiones HTTP.
+- `scripts/online_contract.gd`: versiones de juego/protocolo y generación del `client_match_id` UUIDv4.
+- `scripts/services/auth_service.gd`: OAuth Authorization Code + PKCE, refresh token y perfil público. Conserva `has_java_method()` para el JNISingleton Android.
+- `scripts/services/online_service.gd`: configuración pública, autenticación previa a RPC, envío asíncrono, carga del ranking y errores de red.
+- `supabase/migrations/`: tablas ya existentes, RLS, grants y RPCs versionados.
 
-## Eventos y correlación
+## Envío del resultado
 
-Al comenzar cada ronda local, `_start_game()` genera un UUIDv4 aleatorio mediante `Crypto.generate_random_bytes()`. No usa el RNG compartido por el juego y los efectos visuales. El mismo ID vive desde el countdown hasta el resultado. Se emite:
+`_finish_round()` espera a que termine Final Blast, persiste el récord local y abre resultados. Emite `round_finished(client_match_id, final_score, game_version, online_protocol_version, match_session_id)`. `OnlineService` conserva la señal pero hace POST a `submit_match_score` sin bloquear el hilo del juego. Solo se envían rondas con identidad autenticada disponible y versión de protocolo compatible.
 
-- `round_started(client_match_id, game_version, online_protocol_version)` al preparar la ronda.
-- `round_finished(client_match_id, final_score, game_version, online_protocol_version, match_session_id)` cuando `_finish_round()` ya liquidó Final Blast, guardó el mejor récord local y cambió el estado a resultados.
+El body contiene `p_client_match_id`, `p_game_version` y `p_score`; no contiene `user_id`, `season_id` ni email. El servidor usa `auth.uid()`, `get_current_season()` y `client_match_id` único por usuario. Los reintentos de la misma ronda son idempotentes y no pueden cambiar el score original.
 
-El ID identifica un intento del cliente; no prueba identidad, score ni legitimidad. La identidad futura se obtiene exclusivamente de `auth.uid()` dentro del backend. El `match_session_id` está vacío en esta fase y no se debe inventar.
+Esta fase acepta el score reclamado por el cliente para desarrollo. La fila de `matches` usa `pending_review`, `score_verified` queda vacío y `session_id` es `NULL`: no se fabrica un ticket. Una partida sin sesión de Auth continúa localmente y conserva su récord.
 
-## Versiones
+## Temporadas y ranking
 
-- `GAME_VERSION = 0.1.0`: versión inicial para el contrato; se sube cuando un cambio en gameplay o score afecta la interpretación de una partida.
-- `ONLINE_PROTOCOL_VERSION = 1`: versión del formato de mensajes cliente/backend; solo cambia al cambiar su forma o semántica.
+`get_current_season()` calcula semanas ISO en UTC usando hora PostgreSQL y crea la fila de esa semana. `submit_match_score()` inserta el historial en `matches` y hace upsert del máximo en `weekly_scores`; un score inferior no sustituye al mejor. Las temporadas anteriores y sus filas no se borran.
 
-Ambas constantes viven en `OnlineContract`, no dispersas en `game.gd`. La siguiente fase debe asignar una versión de producto antes de aceptar partidas competitivas.
+`get_weekly_leaderboard(p_limit)` devuelve posición, `handle`, `best_score`, `is_me`, clave de temporada y cierre UTC. La UI pide 20, muestra hasta 25 si se configura así, y recibe la fila propia adicional cuando queda fuera del top. Si aún no hay score propio, informa que no se clasificó esa semana. No incluye email. La carga ocurre al abrir la pantalla o actualizar; la respuesta se descarta si quedó obsoleta.
 
-## Partida local y futura partida rankeada
+## RLS y claves
 
-Una partida sin ticket de backend (`match_session`) siempre se juega, puntúa y llega a resultados; persiste el récord en `user://glint_rush.cfg` y permite revancha. No puede incorporarse al ranking semanal.
+RLS sigue activo. `authenticated` no recibe escrituras directas a sesiones, partidas ni puntuaciones. `submit_match_score()` es `SECURITY DEFINER`, fija `search_path` vacío, exige `auth.uid()` y solo se concede a `authenticated`. El propietario de la fila se deriva del JWT. `get_weekly_leaderboard()` es `SECURITY INVOKER` y lee solo columnas ya concedidas por la fundación.
 
-Una futura partida rankeada necesitará un ticket de servidor que vincule `user_id`, `season_id`, seed, versión y caducidad. La temporada y sus tiempos se derivan de PostgreSQL UTC. El cliente no elige esos valores. No se aceptará score hasta que exista un `submit_match` seguro y una sesión auténtica; ambos están deliberadamente fuera de esta entrega.
+`backend_config.cfg` sigue fuera de Git. El juego solo utiliza URL y clave pública de Supabase. Nunca incluir `service_role`, una secret key ni Google Client Secret. El package Android sigue siendo `com.glintrush.game`; OAuth mantiene el deep link `glintrush://auth/callback`, PKCE y almacenamiento seguro Android.
 
-## Persistencia y ranking
+## Fallos y modo offline
 
-- `matches`: historial de partidas, con clave idempotente por `(user_id, client_match_id)` y un solo consumo por `session_id`.
-- `weekly_scores`: máximo un agregado por `(season_id, user_id)`, independiente del récord local. Solo backend podrá escribirlo.
-- Orden futuro: `best_score DESC`, `achieved_at ASC`, `user_id ASC`.
-- `season_awards`: snapshot de podios con `display_name_snapshot`; `user_id` anulable para conservar el podio al anonimizar/eliminar la cuenta.
-- Los scores de usuario no se borran al rotar de semana. Esta etapa no automatiza cierre ni premia ganadores.
+Los errores de configuración, Auth, HTTP, timeout o respuesta no válida producen un texto amigable. No detienen el cierre local de la partida ni el botón de revancha o regreso al menú. No hay cola local de scores para sincronizar más tarde. El ranking requiere sesión autenticada.
 
-## Offline y errores
+## Seguridad pendiente antes de competencia pública
 
-`OnlineService` informa errores de configuración, red, timeout, JSON y HTTP por señales. No se invoca desde `_process()` ni es dependencia de `_start_game()` o `_finish_round()`. Sin URL/clave el servicio queda `unconfigured`; caída/timeout deja el servicio `offline`. Ambos estados preservan el juego local.
-
-Los reintentos están limitados y solo pueden solicitarse para GET/HEAD o una operación con `idempotency_key`; no se reintenta un POST no idempotente. No se guardan scores offline pendientes en esta fase.
-
-## Configuración pública y secretos
-
-`SUPABASE_URL` y `SUPABASE_PUBLIC_KEY` identifican el proyecto cliente. Pueden ir en el build; la clave pública no reemplaza RLS. Se pueden cargar desde `backend_config.cfg` o variables de entorno. Ese archivo real está ignorado por Git. No poner `service_role`, secretos Google, contraseñas ni refresh tokens en recursos del juego. Tokens se añadirán con Auth y almacenamiento seguro en otra fase.
-
-## Seguridad SQL actual
-
-RLS está activado en todas las tablas. Los roles `anon` y `authenticated` no pueden escribir tablas de temporada, amistades, sesiones, matches, scores o podios directamente. `profiles` permite lectura autenticada de columnas públicas y concede escritura futura solo a `display_name` y `avatar_key`, sujeta a policy de propietario; el `handle` es permanente. `get_current_season()` requiere usuario autenticado, usa reloj PostgreSQL UTC, fija `search_path` vacío y no acepta timestamps del cliente.
-
-No hay `start_match`, `submit_match`, Auth trigger, Google OAuth, cierre automático, ranking RPC ni CRUD RPC de amigos.
-
-## Deuda técnica para replay/anticheat
-
-El RNG de gameplay actualmente comparte generador con glints, partículas, estrellas y shake. No lo cambiamos para no variar generación observable. Antes de reproducir una partida en servidor habrá que separar streams de RNG, fijar reglas de orden y tie-break internos, y registrar intercambios manuales aceptados con tiempo relativo y versión del simulador.
+El RPC limita score a rango no negativo, propietario, temporada del servidor e idempotencia, pero no valida que el cliente haya jugado legítimamente. Antes de publicación competitiva se necesita ticket server-side por partida, seed y versión de reglas, RNG de gameplay separado de efectos, registro/replay determinista, verificador de score en servidor, rate limits y ranking que cuente solo estados verificados. Consultar [`phase6_competitive.md`](phase6_competitive.md).

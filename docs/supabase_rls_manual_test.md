@@ -108,3 +108,25 @@ rollback;
 Para comprobar una fila de perfil propia sí se puede actualizar `display_name` o `avatar_key`; intentar cambiar `handle` debe producir error de privilegios. `anon` debe carecer de SELECT en perfiles y scores.
 
 > Importante: SQL Editor tiene privilegios administrativos; los `SET LOCAL ROLE` y el claim simulado son solo una prueba local de policies. No usar este método para autenticar una app ni confiar en claims que un cliente pudiera establecer directamente. En producción, PostgREST valida el JWT firmado por Supabase Auth.
+
+## 4. Phase 6: score propio, idempotencia y ranking
+
+Aplicar las migraciones en Supabase local y crear dos usuarios de prueba A/B mediante Auth. Iniciar sesión como A en el juego, jugar hasta resultados y confirmar el texto **Puntuación guardada en el ranking semanal**. En SQL Editor local comprobar:
+
+```sql
+select m.user_id, m.client_match_id, m.score_claimed, m.status, m.session_id
+from public.matches as m
+where m.user_id = 'UUID_A'
+order by m.received_at desc
+limit 5;
+
+select s.season_key, ws.user_id, ws.best_score, ws.achieved_at
+from public.weekly_scores as ws
+join public.seasons as s on s.id = ws.season_id
+where ws.user_id in ('UUID_A', 'UUID_B')
+order by s.starts_at desc, ws.best_score desc;
+```
+
+Esperado: el intento nuevo tiene `status = 'pending_review'` y `session_id IS NULL`; `weekly_scores` conserva una fila por usuario/temporada y guarda el mayor valor. Desde el menú abrir **RANKING SEMANAL**; debe mostrar posición, `@handle` y score. Con una cuenta que no esté en el Top solicitado, el RPC agrega su fila propia y la UI debe mostrar **TU POSICIÓN**. Sin score propio debe indicarlo.
+
+Los tests `supabase/tests/database/phase6_competitive.test.sql` prueban score mejor, duplicado idempotente, top y fila propia fuera del top. También se debe probar manualmente: cerrar/redesactivar Internet después de empezar una ronda, comprobar que el resultado y **VOLVER AL MENÚ** responden sin espera, y volver a abrir el ranking para verificar el mensaje amigable de error. Nunca probar con `service_role` desde el cliente.

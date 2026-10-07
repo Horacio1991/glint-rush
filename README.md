@@ -1,10 +1,10 @@
 # GLINT RUSH — prototipo vertical Godot
 
-Prototipo arcade Match‑3 offline-first para Android. El tablero usa un atlas original de seis gemas con iluminación y volumen, un prisma multicolor separado y tres fondos fantasy seleccionables al azar. La interfaz, partículas y efectos de sonido son propios; no contiene assets de Bejeweled. La entrega incluye una fundación SQL de Supabase, todavía sin autenticación ni funciones de partida en línea.
+Prototipo arcade Match‑3 offline-first para Android. El tablero usa un atlas original de seis gemas con iluminación y volumen, un prisma multicolor separado y tres fondos fantasy seleccionables al azar. La interfaz, partículas y efectos de sonido son propios; no contiene assets de Bejeweled. Incluye login Google/Supabase y ranking semanal opcional; gameplay y récord local funcionan sin conexión.
 
 ## Abrir y ejecutar
 
-1. Instala Godot **4.3 o superior**.
+1. Instala Godot **4.7 o superior** para mantener compatibilidad con el complemento Android de Auth.
 2. Descomprime `glint-rush.zip`.
 3. En Godot Project Manager elige **Importar** y abre `project.godot`.
 4. Pulsa **F6** para ejecutar la escena o **F5** para correr el proyecto.
@@ -81,12 +81,14 @@ El atlas de seis gemas, el prisma y los tres fondos son ilustraciones originales
 
 ## Límites de validación
 
-Las pruebas de lógica cubren generación del tablero, countdown, input bloqueado, reloj, clasificación local, intercambio inválido, caída, puntaje, match T/L, cruz completa y reacciones en cadena, transformaciones deterministas de Prisma a líneas/cruces, Prisma doble, SPEED y liquidación Final Blast con/sin especiales. En esta iteración se amplía el smoke test con IDs por ronda, eventos y comportamiento offline. El smoke test existente y los casos nuevos están en `tests/smoke_test.gd`. En este entorno no hay ejecutable Godot, así que las pruebas no se pueden ejecutar aquí. Tampoco se exportó APK ni se midieron FPS en teléfono. Los efectos de tablero usan `_draw()` y no crean nodos por gema o partícula; el rendimiento final debe medirse en el Android objetivo.
+Las pruebas de lógica cubren generación del tablero, countdown, input bloqueado, reloj, ranking local, ranking online (respuestas obsoletas y filtrado de campos), volver al menú, score local sin sesión, intercambio inválido, caída, especiales, cascadas, SPEED y Final Blast. El smoke test está en `tests/smoke_test.gd`; las pruebas SQL de Phase 6 en `supabase/tests/database/phase6_competitive.test.sql`. En este entorno no hay ejecutable Godot, `psql`, Supabase CLI ni Android SDK/ADB, así que esas pruebas y la exportación Android quedan pendientes de ejecutar.
 
 ## Fase 5 — UX y game feel
 
 La pantalla de partida incluye botones **REINICIAR** y **SALIR** con diálogo de confirmación. El reinicio genera una ronda nueva sin tocar AuthService y cancela resoluciones, tweens y audio diferido de la ronda anterior. El botón **SALIR DE LA CUENTA** aparece centrado en la pantalla inicial. Consulta [`docs/phase5_gamefeel.md`](docs/phase5_gamefeel.md) para el detalle de input, resolución de especiales, pruebas y pendientes.
 
-## Fundación online
+## Fase 6 — competencia semanal (desarrollo)
 
-Esta entrega agrega un autoload `OnlineService`, IDs UUID por ronda y la base SQL inicial de Supabase. El juego continúa en modo local y no envía scores. Para migraciones y pruebas del backend local, consulta [`supabase/README.md`](supabase/README.md) y el [contrato online](docs/online_architecture.md). El archivo `backend_config.cfg` es opcional, está ignorado por Git y solo admite URL/clave pública; no copies una clave `service_role`.
+Al terminar una partida autenticada, `OnlineService` envía el score de forma asíncrona. Desde resultados se puede volver al menú y abrir **RANKING SEMANAL** para ver posición, `@handle` y mejor score. La UI solicita Top 20; si la cuenta queda fuera, se incluye su posición. Se reutilizan `matches`, `weekly_scores` y `seasons` con RPCs autenticadas y sin escrituras directas desde cliente.
+
+El score sigue siendo declarado por el cliente y las partidas quedan `pending_review`; es solo para desarrollo, no anti-cheat. Las semanas son ISO UTC y mantienen el historial. Los fallos de red nunca bloquean el juego. Ver [`docs/phase6_competitive.md`](docs/phase6_competitive.md) para RPCs, RLS, pruebas y requisitos de validación server-side. `backend_config.cfg` continúa opcional e ignorado; solo admite URL/clave pública, nunca `service_role`.

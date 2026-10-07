@@ -27,6 +27,10 @@ func _run() -> void:
 	root.get_node("OnlineService").request_failed.connect(func(_request_id: int, _status_code: int, _code: String, _detail: String) -> void:
 		service_error_count[0] += 1
 	)
+	var score_submission_updates: Array[Dictionary] = []
+	root.get_node("OnlineService").score_submission_updated.connect(func(match_id: String, state: String, detail: String) -> void:
+		score_submission_updates.append({"id": match_id, "state": state, "detail": detail})
+	)
 	var rejected_request_id: int = root.get_node("OnlineService").request_json(HTTPClient.METHOD_GET, "/rest/v1/never-called-in-game")
 	assert(rejected_request_id > 0 and service_error_count[0] == 1, "offline/test-mode backend failure should be reported without a network call")
 	assert(not root.get_node("OnlineService").has_authenticated_session(), "this phase must not invent an authenticated session")
@@ -45,6 +49,9 @@ func _run() -> void:
 	assert(not bool(root.get_node("AuthService").parse_callback_url("glintrush://other/callback?code=x&state=" + oauth_state).get("ok", false)), "callbacks from another URI must be rejected")
 	assert(not root.get_node("AuthService").start_google_login(), "GLINT_RUSH_TEST must prevent browser or network authentication")
 	assert(not root.get_node("OnlineService").has_authenticated_session(), "authentication smoke coverage must not create a fake session")
+	root.get_node("OnlineService").on_round_started("offline-round", ONLINE_CONTRACT.GAME_VERSION, ONLINE_CONTRACT.ONLINE_PROTOCOL_VERSION)
+	root.get_node("OnlineService").on_round_finished("offline-round", 1234, ONLINE_CONTRACT.GAME_VERSION, ONLINE_CONTRACT.ONLINE_PROTOCOL_VERSION, "")
+	assert(score_submission_updates.size() == 1 and score_submission_updates[0]["state"] == "local", "a round without authenticated identity must remain local and must not send a score")
 	var auth_source := FileAccess.get_file_as_string("res://scripts/services/auth_service.gd")
 	assert(auth_source.contains("has_java_method(") and not auth_source.contains("_bridge.has_method("), "Android auth bridge must keep Java method checks")
 	assert(game.gem_atlas != null, "transparent gem atlas should load")
@@ -57,6 +64,29 @@ func _run() -> void:
 	assert(ResourceLoader.exists("res://assets/sfx/start_go.wav"), "the GO cue should be an original bundled sound")
 	for sound_path in ["cross.wav", "cross_create.wav", "prism_charge.wav", "prism_transform.wav", "final_warning.wav", "final_blast.wav", "speed_shimmer.wav", "speed_harmony.wav"]:
 		assert(ResourceLoader.exists("res://assets/sfx/" + sound_path), "new original sound should be bundled: " + sound_path)
+	game.game_state = "title"
+	game.call("_draw_title")
+	assert(game.title_leaderboard_rect.size.x > 0.0, "the main menu should expose the weekly leaderboard")
+	var leaderboard_button_center: Vector2 = game.title_leaderboard_rect.get_center()
+	game.call("_pointer_start", leaderboard_button_center)
+	game.call("_pointer_end", leaderboard_button_center)
+	assert(game.game_state == "leaderboard", "the menu leaderboard button should open the ranking screen")
+	game.call("_return_to_menu")
+	game.game_state = "leaderboard"
+	game.leaderboard_request_generation = 44
+	game.call("_on_leaderboard_loaded", 43, true, [{"position": 1, "handle": "stale", "best_score": 999, "is_me": true}], "")
+	assert(game.leaderboard_entries.is_empty(), "a stale leaderboard response must not replace the current screen")
+	game.call("_on_leaderboard_loaded", 44, true, [{"position": 1, "handle": "crystalfox", "best_score": 582340, "is_me": true, "email": "private@example.invalid"}], "")
+	assert(game.leaderboard_entries.size() == 1 and game.leaderboard_entries[0]["handle"] == "crystalfox", "leaderboard should accept only the public handle and score data")
+	assert(not game.leaderboard_entries[0].has("email"), "the leaderboard view model must discard private profile fields")
+	game.game_state = "result"
+	game.call("_draw_result")
+	assert(game.result_menu_rect.size.x > 0.0, "the result screen should expose a VOLVER AL MENÚ button")
+	var generation_before_menu: int = game.round_generation
+	var result_menu_center: Vector2 = game.result_menu_rect.get_center()
+	game.call("_pointer_start", result_menu_center)
+	game.call("_pointer_end", result_menu_center)
+	assert(game.game_state == "title" and game.round_generation == generation_before_menu + 1, "VOLVER AL MENÚ should invalidate prior-round async work")
 	game.call("_start_game")
 	var first_match_id: String = game.client_match_id
 	assert(first_match_id.split("-").size() == 5 and first_match_id.length() == 36, "each round should receive a UUID client_match_id")
@@ -383,7 +413,7 @@ func _run() -> void:
 	assert(local_record_cfg.load("user://glint_rush.cfg") == OK, "the existing local record file should still be saved")
 	assert(int(local_record_cfg.get_value("local", "best", 0)) == game.best_score, "the saved local best should remain authoritative for the local record")
 
-	print("SMOKE TEST PASS: generation, touch drag direction/threshold, gesture guards, countdown/GO, simulated ranking, local scoring/record, match IDs/events, offline/test-mode service failure, 4/5/T/L specials, old-special activation with preserved new-special creation, full cross and chain reaction, deterministic Prisma conversions, Prisma pair/color clear, SPEED streak/pitch/expiry, restart cancellation, timeout settlement, Final Blast/no-special finish/final scoring")
+	print("SMOKE TEST PASS: generation, touch drag direction/threshold, gesture guards, countdown/GO, local demo ranking, online leaderboard response generation/privacy filtering, result-to-menu cleanup, authenticated-score offline fallback, local scoring/record, match IDs/events, 4/5/T/L specials, old-special activation with preserved new-special creation, full cross and chain reaction, deterministic Prisma conversions, Prisma pair/color clear, SPEED streak/pitch/expiry, restart cancellation, timeout settlement, Final Blast/no-special finish/final scoring")
 	game.music_player.stop()
 	game.music_player.stream = null
 	for player in game.sfx_players:

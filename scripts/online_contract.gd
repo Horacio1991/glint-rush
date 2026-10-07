@@ -4,7 +4,7 @@ class_name OnlineContract
 # Bump GAME_VERSION when gameplay/scoring rules change. Bump the protocol only
 # when the shape or meaning of client/backend messages changes.
 const GAME_VERSION := "0.1.0"
-const ONLINE_PROTOCOL_VERSION := 1
+const ONLINE_PROTOCOL_VERSION := 2
 
 
 static func new_client_match_id() -> String:

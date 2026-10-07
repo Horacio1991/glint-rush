@@ -4,6 +4,8 @@ signal online_status_changed(status: String, detail: String)
 signal request_succeeded(request_id: int, status_code: int, data: Variant)
 signal request_failed(request_id: int, status_code: int, code: String, detail: String)
 signal round_observed(client_match_id: String, phase: String)
+signal score_submission_updated(client_match_id: String, state: String, detail: String)
+signal leaderboard_loaded(request_generation: int, success: bool, data: Variant, message: String)
 
 const ONLINE_CONTRACT = preload("res://scripts/online_contract.gd")
 const CONFIG_RESOURCE_PATH := "res://backend_config.cfg"
@@ -23,6 +25,7 @@ var _refresh_token := ""
 var _access_token_expires_at := 0
 var _active_match_session_id := ""
 var _test_mode := false
+var _submitted_match_ids: Dictionary = {}
 
 
 func _ready() -> void:
@@ -157,7 +160,7 @@ func on_round_started(client_match_id: String, game_version: String, protocol_ve
 	last_match_phase = "started"
 	_active_match_session_id = ""
 	round_observed.emit(client_match_id, "started")
-	# Deliberately no network request in this phase. Auth and start_match are later work.
+	# Scores are sent only at round end. A server-issued start_match ticket is future work.
 	if game_version != ONLINE_CONTRACT.GAME_VERSION or protocol_version != ONLINE_CONTRACT.ONLINE_PROTOCOL_VERSION:
 		push_warning("Round metadata does not match the centralized online contract")
 
@@ -167,13 +170,56 @@ func on_round_finished(client_match_id: String, final_score: int, game_version: 
 		return
 	last_match_phase = "finished"
 	round_observed.emit(client_match_id, "finished")
-	# Never submit a score until a real authenticated session and server-issued
-	# match_session exist. No credentials or fake session are created in this phase.
-	if not has_authenticated_session() or match_session_id.is_empty() or not has_ranked_match_session():
+	if game_version != ONLINE_CONTRACT.GAME_VERSION or protocol_version != ONLINE_CONTRACT.ONLINE_PROTOCOL_VERSION:
+		push_warning("Refusing score submission with an unsupported online contract")
 		return
-	# Future: send an idempotent submit_match request here. Kept intentionally
-	# unimplemented so this foundation cannot accept an unvalidated client score.
-	var _unused := [final_score, game_version, protocol_version]
+	if final_score < 0 or _submitted_match_ids.has(client_match_id):
+		return
+	# No score is queued locally. A real profile identity is required; refresh and
+	# HTTP work happen asynchronously after the result screen is already visible.
+	var profile_user_id := str(AuthService.profile.get("user_id", ""))
+	if profile_user_id.is_empty() or AuthService.auth_state in ["unauthenticated", "error"]:
+		score_submission_updated.emit(client_match_id, "local", "Partida local; iniciá sesión para clasificar.")
+		return
+	_submitted_match_ids[client_match_id] = true
+	score_submission_updated.emit(client_match_id, "pending", "Enviando puntuación…")
+	call_deferred("_submit_round_score", client_match_id, final_score, game_version, match_session_id)
+
+
+func _submit_round_score(client_match_id: String, final_score: int, game_version: String, _match_session_id: String) -> void:
+	if not is_configured():
+		score_submission_updated.emit(client_match_id, "failed", "No se pudo guardar en línea. La partida quedó disponible localmente.")
+		return
+	var payload := {
+		"p_client_match_id": client_match_id,
+		"p_game_version": game_version,
+		"p_score": final_score,
+	}
+	var result: Dictionary = await request_authenticated_json(HTTPClient.METHOD_POST, "/rest/v1/rpc/submit_match_score", payload)
+	if bool(result.get("ok", false)):
+		score_submission_updated.emit(client_match_id, "saved", "Puntuación guardada en el ranking semanal.")
+	else:
+		score_submission_updated.emit(client_match_id, "failed", "No se pudo guardar en línea. La partida quedó disponible localmente.")
+
+
+func fetch_weekly_leaderboard(limit: int, request_generation: int) -> void:
+	call_deferred("_fetch_weekly_leaderboard", clampi(limit, 1, 25), request_generation)
+
+
+func _fetch_weekly_leaderboard(limit: int, request_generation: int) -> void:
+	if not is_configured():
+		leaderboard_loaded.emit(request_generation, false, [], "No se pudo cargar el ranking. Revisá la conexión e intentá de nuevo.")
+		return
+	var result: Dictionary = await request_authenticated_json(
+		HTTPClient.METHOD_POST,
+		"/rest/v1/rpc/get_weekly_leaderboard",
+		{"p_limit": limit}
+	)
+	if not bool(result.get("ok", false)) or not result.get("data", null) is Array:
+		var message := "Iniciá sesión para consultar el ranking." if str(result.get("error", "")) == "unauthenticated" else "No se pudo cargar el ranking. Revisá la conexión e intentá de nuevo."
+		leaderboard_loaded.emit(request_generation, false, [], message)
+		return
+	leaderboard_loaded.emit(request_generation, true, result.get("data", []), "")
 
 
 func request_json(method: int, path: String, payload: Variant = null, bearer_token: String = "", max_retries: int = 0, idempotency_key: String = "") -> int:
