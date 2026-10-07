@@ -98,7 +98,7 @@ create or replace function public.get_weekly_leaderboard(p_limit integer default
 returns table (
     season_key text,
     season_ends_at timestamptz,
-    position bigint,
+    "position" bigint,
     handle text,
     best_score bigint,
     is_me boolean
