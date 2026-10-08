@@ -4,6 +4,7 @@ signal round_started(client_match_id: String, game_version: String, protocol_ver
 signal round_finished(client_match_id: String, final_score: int, game_version: String, protocol_version: int, match_session_id: String)
 
 const ONLINE_CONTRACT = preload("res://scripts/online_contract.gd")
+const COMPETITIVE_TARGET = preload("res://scripts/competitive_target.gd")
 
 # -----------------------------------------------------------------------------
 # GLINT RUSH — first playable slice. All game tuning lives in this block.
@@ -70,11 +71,6 @@ const CONFIG := {
 	"COUNTDOWN_STEP_SEC": 0.76,
 	"COUNTDOWN_GO_SEC": 0.52,
 	"COUNTDOWN_FONT_SIZE": 136,
-	"LOCAL_RIVALS": [
-		{"name": "NOVA", "finish_score": 21800, "pace": 1.08},
-		{"name": "LUNA", "finish_score": 17900, "pace": 1.0},
-		{"name": "BYTE", "finish_score": 14200, "pace": 0.92},
-	],
 	"MENU_GLOW": 0.18,
 	"HAPTICS_ENABLED": true,
 	"SOUND_ENABLED": true,
@@ -84,8 +80,9 @@ var GEM_COLORS := PackedColorArray([
 	Color("ff3d71"), Color("27c5ff"), Color("57f56b"),
 	Color("ffd43b"), Color("d75cff"), Color("ff8646")
 ])
-const GEM_NAMES := ["RUBÍ", "ZAFIRO", "ESMERALDA", "CITRINO", "AMATISTA", "ÓPALO"]
+const GEM_NAMES := ["RUBÍ", "ZAFIRO", "ESMERALDA", "TOPACIO", "AMATISTA", "CITRINO"]
 const GEM_SPRITE_INDEX := [0, 2, 1, 4, 3, 5]
+const GEM_ATLAS_DRAW_SCALE := 2.12
 const SFX := {
 	"swap": "res://assets/sfx/swap.wav",
 	"match": "res://assets/sfx/match.wav",
@@ -205,6 +202,11 @@ var leaderboard_loading := false
 var leaderboard_message := ""
 var leaderboard_season_key := ""
 var leaderboard_request_generation := 0
+var round_target_request_generation := 0
+var round_target: Dictionary = {}
+var round_target_pending := false
+var round_target_locked := false
+var round_target_completed := false
 
 
 func _ready() -> void:
@@ -215,9 +217,9 @@ func _ready() -> void:
 	focus_mode = Control.FOCUS_ALL
 	_make_stars()
 	_make_ui_styles()
-	gem_atlas = load("res://assets/gems/gem_atlas.png")
+	gem_atlas = load("res://assets/gems/arcade_gem_atlas.png")
 	prism_texture = load("res://assets/gems/prism_core.png")
-	for path in ["res://assets/backgrounds/crystal_valley.jpg", "res://assets/backgrounds/sky_observatory.jpg", "res://assets/backgrounds/prism_gorge.jpg"]:
+	for path in ["res://assets/backgrounds/glint_arena.jpg", "res://assets/backgrounds/sky_observatory.jpg", "res://assets/backgrounds/prism_gorge.jpg"]:
 		var background: Texture2D = load(path)
 		if background != null:
 			background_textures.append(background)
@@ -233,9 +235,11 @@ func _ready() -> void:
 	music_stream.loop_end = music_stream.data.size() / 2
 	music_player.stream = music_stream
 	best_score = _load_best()
+	round_target = COMPETITIVE_TARGET.local_fallback(best_score)
 	AuthService.auth_state_changed.connect(_on_auth_state_changed)
 	OnlineService.score_submission_updated.connect(_on_score_submission_updated)
 	OnlineService.leaderboard_loaded.connect(_on_leaderboard_loaded)
+	OnlineService.leaderboard_loaded.connect(_on_round_target_loaded)
 	set_process(true)
 	queue_redraw()
 
@@ -289,6 +293,7 @@ func _process(delta: float) -> void:
 		final_blast_age += delta
 	if game_state == "playing":
 		_update_speed_state(delta, Time.get_ticks_msec())
+		_update_competitive_target_completion()
 		var urgent_mix := 1.0 - clampf(seconds_left / 10.0, 0.0, 1.0)
 		var desired_music_db := lerpf(float(CONFIG["MUSIC_BASE_DB"]), float(CONFIG["MUSIC_URGENT_DB"]), urgent_mix)
 		music_player.volume_db = move_toward(music_player.volume_db, desired_music_db, delta * 3.0)
@@ -591,6 +596,8 @@ func _advance_countdown(now_msec: int) -> void:
 			_set_countdown_label("1", float(CONFIG["COUNTDOWN_STEP_SEC"]), now_msec)
 			_play_sfx("countdown", 1.14, -4.0)
 		else:
+			round_target_locked = true
+			round_target_pending = false
 			_set_countdown_label("¡YA!", float(CONFIG["COUNTDOWN_GO_SEC"]), now_msec)
 			game_state = "playing"
 			input_locked = false
@@ -1210,9 +1217,17 @@ func _start_game() -> void:
 	deadline_msec = 0
 	seconds_left = float(CONFIG["ROUND_SECONDS"])
 	game_state = "countdown"
+	round_target = COMPETITIVE_TARGET.local_fallback(best_score)
+	round_target_completed = false
+	round_target_locked = false
+	round_target_pending = true
+	round_target_request_generation = -round_generation
 	music_player.stop()
 	_play_sfx("countdown", 0.91, -6.0)
 	round_started.emit(client_match_id, ONLINE_CONTRACT.GAME_VERSION, ONLINE_CONTRACT.ONLINE_PROTOCOL_VERSION)
+	# One authenticated Top 25 snapshot per round, started before the countdown.
+	# Late results are ignored once GO has locked the local target.
+	OnlineService.fetch_weekly_leaderboard(25, round_target_request_generation)
 	queue_redraw()
 
 
@@ -1443,13 +1458,13 @@ func _cell_at(pos: Vector2) -> Vector2i:
 
 func _make_ui_styles() -> void:
 	ui_board_style = StyleBoxFlat.new()
-	ui_board_style.bg_color = Color(0.012, 0.016, 0.048, 0.97)
-	ui_board_style.set_corner_radius_all(12)
-	ui_board_style.set_border_width_all(2)
-	ui_board_style.border_color = Color("84704d")
-	ui_board_style.shadow_color = Color(0.13, 0.13, 0.52, 0.30)
-	ui_board_style.shadow_size = 17
-	ui_board_style.shadow_offset = Vector2(0, 7)
+	ui_board_style.bg_color = Color(0.010, 0.006, 0.027, 0.98)
+	ui_board_style.set_corner_radius_all(16)
+	ui_board_style.set_border_width_all(3)
+	ui_board_style.border_color = Color("d7ad5f")
+	ui_board_style.shadow_color = Color(0.14, 0.08, 0.48, 0.44)
+	ui_board_style.shadow_size = 22
+	ui_board_style.shadow_offset = Vector2(0, 9)
 	ui_cabinet_style = StyleBoxFlat.new()
 	ui_cabinet_style.bg_color = Color(0.015, 0.020, 0.060, 0.53)
 	ui_cabinet_style.set_corner_radius_all(18)
@@ -1477,26 +1492,32 @@ func _make_ui_styles() -> void:
 
 
 func _draw_background() -> void:
+	# Reuse one timestamp for the ambient animation. Sampling the OS clock once per
+	# star used to do 72 redundant calls during every full-canvas redraw.
+	var now_msec := Time.get_ticks_msec()
 	draw_rect(Rect2(Vector2.ZERO, size), Color("050814"))
-	if (game_state == "playing" or game_state == "countdown" or game_state == "result") and not background_textures.is_empty():
+	if not background_textures.is_empty():
 		draw_texture_rect(background_textures[active_background_index], Rect2(Vector2.ZERO, size), false)
-		draw_rect(Rect2(Vector2.ZERO, size), Color(0.008, 0.012, 0.032, 0.60), true)
+		var shade := 0.25 if game_state == "playing" or game_state == "countdown" else (0.12 if game_state == "title" else 0.40)
+		draw_rect(Rect2(Vector2.ZERO, size), Color(0.008, 0.012, 0.032, shade), true)
 	else:
 		draw_rect(Rect2(0, 0, size.x, size.y * 0.61), Color(0.035, 0.10, 0.34, 0.72))
 		draw_circle(Vector2(size.x * 0.49, size.y * 0.34), size.y * 0.49, Color(0.0, 0.50, 1.0, 0.11))
 		draw_circle(Vector2(size.x * 0.52, size.y * 0.31), size.y * 0.31, Color(0.32, 0.11, 0.78, 0.10))
-	var ambient_phase := Time.get_ticks_msec() * 0.00012
+	var ambient_phase := now_msec * 0.00012
 	for i in range(5):
 		var beam_x := size.x * (0.10 + i * 0.20) + sin(ambient_phase + i) * 28.0
 		var beam_alpha := 0.012 if game_state == "playing" or game_state == "countdown" or game_state == "result" else 0.025
 		draw_line(Vector2(beam_x - 40, 0), Vector2(beam_x + 80, size.y * 0.72), Color(0.44, 0.65, 1.0, beam_alpha), 28.0, true)
 	for i in range(stars.size()):
 		var s: Dictionary = stars[i]
-		var pulse := 0.58 + 0.42 * sin(Time.get_ticks_msec() * 0.0012 + float(s["phase"]))
+		var pulse := 0.58 + 0.42 * sin(now_msec * 0.0012 + float(s["phase"]))
 		var r: float = float(s["radius"])
 		draw_circle(Vector2(s["pos"]), r, Color(0.55, 0.88, 1.0, float(s["alpha"]) * pulse))
 		if i % 8 == 0:
-			_draw_sparkle(Vector2(s["pos"]), r * 2.0, Color(0.5, 0.87, 1.0, 0.27 * pulse))
+			var sparkle_color := Color(0.5, 0.87, 1.0, 0.27 * pulse)
+			draw_colored_polygon(s["sparkle_vertical"], sparkle_color)
+			draw_colored_polygon(s["sparkle_horizontal"], Color(sparkle_color.r, sparkle_color.g, sparkle_color.b, sparkle_color.a * 0.7))
 	if game_state == "title" or game_state == "result":
 		draw_rect(Rect2(0, 0, size.x, 4), Color("56ddff"))
 		draw_rect(Rect2(0, 4, size.x, 2), Color(0.45, 0.3, 1.0, 0.62))
@@ -1593,72 +1614,77 @@ func _draw_hud() -> void:
 	var entry := clampf(hud_age / float(CONFIG["HUD_ENTRY_TIME"]), 0.0, 1.0)
 	var slide := 1.0 - pow(1.0 - entry, 3.0)
 	var panel_y := lerpf(-18.0, 17.0, slide)
-	var header := Rect2(17.0, panel_y, size.x - 34.0, 164.0)
 	var board_rect: Rect2 = _board_geometry()["rect"]
-	var timebar_y := board_rect.end.y + 9.0
-	var timebar_height := float(CONFIG["TIMEBAR_HEIGHT"])
-	var rank_panel := _ranking_panel_rect()
-	var cabinet_top := panel_y - 8.0
-	var cabinet_bottom := maxf(timebar_y + timebar_height + 13.0, rank_panel.end.y + 10.0)
-	var cabinet := Rect2(9.0, cabinet_top, size.x - 18.0, cabinet_bottom - cabinet_top)
-	var urgent := clampf((10.0 - seconds_left) / 10.0, 0.0, 1.0)
+	var urgent := _timer_urgency()
 	var pulse := 0.5 + 0.5 * sin(now * lerpf(2.8, 8.0, urgent))
-	var resting_border := Color("8b714c")
-	ui_cabinet_style.border_color = resting_border.lerp(Color("ff597d"), urgent * (0.68 + pulse * 0.16))
-	draw_style_box(ui_cabinet_style, cabinet)
-	_draw_ornamental_frame(cabinet, Color("c4a36a").lerp(Color("ff687b"), urgent * 0.52), 9.0)
-	ui_hud_style.border_color = Color("4778d8")
-	draw_style_box(ui_hud_style, header)
-	_draw_ornamental_frame(header, Color("b39a6e"), 8.0)
-	var col := header.size.x / 3.0
-	var left_x := header.position.x
-	var middle_x := left_x + col
-	var right_x := middle_x + col
-	# Shaded bays keep the console readable while sharing one continuous arcade frame.
-	draw_rect(Rect2(header.position + Vector2(3, 3), Vector2(col - 3, header.size.y - 6)), Color(0.04, 0.12, 0.31, 0.31), true)
-	draw_rect(Rect2(Vector2(middle_x, header.position.y + 3), Vector2(col, header.size.y - 6)), Color(0.12, 0.07, 0.32, 0.35), true)
-	draw_rect(Rect2(Vector2(right_x, header.position.y + 3), Vector2(col - 3, header.size.y - 6)), Color(0.04, 0.12, 0.31, 0.31), true)
-	draw_line(Vector2(middle_x, header.position.y + 18), Vector2(middle_x, header.end.y - 18), Color(0.49, 0.74, 1.0, 0.35), 1.5, true)
-	draw_line(Vector2(right_x, header.position.y + 18), Vector2(right_x, header.end.y - 18), Color(0.49, 0.74, 1.0, 0.35), 1.5, true)
-	_draw_hud_panel_glint(header, now + 0.15)
-	var score_size := 36 + int(5.0 * score_pop)
-	draw_string(ThemeDB.fallback_font, Vector2(left_x + 17, panel_y + 30), "PUNTAJE", HORIZONTAL_ALIGNMENT_LEFT, -1, 16, Color("a9d8ff"))
-	draw_string_outline(ThemeDB.fallback_font, Vector2(left_x + 15, panel_y + 78), _format_score(score), HORIZONTAL_ALIGNMENT_LEFT, col - 26, score_size, 4, Color(0.02, 0.04, 0.19, 0.96))
-	draw_string(ThemeDB.fallback_font, Vector2(left_x + 17, panel_y + 78), _format_score(score), HORIZONTAL_ALIGNMENT_LEFT, col - 26, score_size, Color("fff1a4"))
+	var gap := 8.0
+	var inner_width := size.x - 28.0 - gap * 2.0
+	var score_width := inner_width * 0.36
+	var speed_width := inner_width * 0.30
+	var timer_width := inner_width - score_width - speed_width
+	var score_panel := Rect2(14.0, panel_y, score_width, 151.0)
+	var speed_panel := Rect2(score_panel.end.x + gap, panel_y, speed_width, 151.0)
+	var timer_panel := Rect2(speed_panel.end.x + gap, panel_y, timer_width, 151.0)
+	_draw_arcade_glass_panel(score_panel, Color("46caff"), Color("e5be72"), now + 0.08)
+	_draw_arcade_glass_panel(speed_panel, Color("c568ff").lerp(Color("42ecff"), speed_intensity), Color("dfb75f"), now + 0.32)
+	var urgent_edge := Color("48dfff").lerp(Color("ff5f77"), urgent * (0.68 + pulse * 0.12))
+	_draw_arcade_glass_panel(timer_panel, urgent_edge, Color("f0c878"), now + 0.61)
+	var left_x := score_panel.position.x
+	var col := score_panel.size.x
+	var score_size := 44 + int(5.0 * score_pop)
+	draw_string(ThemeDB.fallback_font, Vector2(left_x + 15, panel_y + 26), "PUNTAJE", HORIZONTAL_ALIGNMENT_LEFT, -1, 15, Color("bdeeff"))
+	draw_string_outline(ThemeDB.fallback_font, Vector2(left_x + 13, panel_y + 70), _format_score(score), HORIZONTAL_ALIGNMENT_LEFT, col - 24, score_size, 4, Color(0.02, 0.04, 0.19, 0.96))
+	draw_string(ThemeDB.fallback_font, Vector2(left_x + 15, panel_y + 70), _format_score(score), HORIZONTAL_ALIGNMENT_LEFT, col - 24, score_size, Color("fff1a4"))
 	var best_color := Color("fff09b") if record_beaten else Color("99d9ff")
 	var best_text := "RÉCORD  " + _format_score(best_score)
 	if record_beaten:
 		best_text = "¡NUEVO RÉCORD!  " + _format_score(best_score)
-	draw_string(ThemeDB.fallback_font, Vector2(left_x + 17, panel_y + 109), best_text, HORIZONTAL_ALIGNMENT_LEFT, col - 25, 14, best_color)
-	draw_string(ThemeDB.fallback_font, Vector2(left_x + 17, panel_y + 137), "POSICIÓN  " + str(_player_rank_position()) + "º", HORIZONTAL_ALIGNMENT_LEFT, col - 25, 15, Color("f0cf8a"))
-	draw_string(ThemeDB.fallback_font, Vector2(middle_x, panel_y + 30), "SPEED  ·  RACHA", HORIZONTAL_ALIGNMENT_CENTER, col, 16, Color("b9dcff"))
+	draw_string(ThemeDB.fallback_font, Vector2(left_x + 15, panel_y + 101), best_text, HORIZONTAL_ALIGNMENT_LEFT, col - 25, 13, best_color)
+	var position_label := _player_position_label()
+	if not position_label.is_empty():
+		draw_string(ThemeDB.fallback_font, Vector2(left_x + 15, panel_y + 128), position_label, HORIZONTAL_ALIGNMENT_LEFT, col - 25, 12, Color("f0cf8a"))
+	var middle_x := speed_panel.position.x
+	var speed_col := speed_panel.size.x
 	var streak_tint := Color("9aeaff").lerp(Color("ffe28a"), speed_intensity)
-	var streak_label := "RACHA %02d" % speed_streak if speed_streak > 0 else "RACHA —"
-	var streak_pop := 1.0 + speed_pulse * 0.08
-	var streak_size := int(25 * streak_pop)
-	draw_string_outline(ThemeDB.fallback_font, Vector2(middle_x + 10, panel_y + 75), streak_label, HORIZONTAL_ALIGNMENT_CENTER, col - 86, streak_size, 3, Color(0.03, 0.03, 0.20, 0.95))
-	draw_string(ThemeDB.fallback_font, Vector2(middle_x + 10, panel_y + 75), streak_label, HORIZONTAL_ALIGNMENT_CENTER, col - 86, streak_size, streak_tint)
-	var badge := Rect2(middle_x + col - 69, panel_y + 44, 51, 46)
-	var old_badge_border := ui_hud_style.border_color
-	ui_hud_style.border_color = Color("85f6ff").lerp(Color("fff283"), speed_intensity)
-	draw_style_box(ui_hud_style, badge)
-	_draw_ornamental_frame(badge, Color("ead08b").lerp(Color("90fbff"), speed_intensity), 5.0)
-	ui_hud_style.border_color = old_badge_border
-	var multiplier_size := int(27 + speed_pulse * 4)
-	draw_string_outline(ThemeDB.fallback_font, Vector2(badge.position.x, badge.position.y + 32), "x" + str(speed_multiplier), HORIZONTAL_ALIGNMENT_CENTER, badge.size.x, multiplier_size, 3, Color(0.04, 0.03, 0.18, 0.95))
-	draw_string(ThemeDB.fallback_font, Vector2(badge.position.x, badge.position.y + 32), "x" + str(speed_multiplier), HORIZONTAL_ALIGNMENT_CENTER, badge.size.x, multiplier_size, streak_tint)
-	var streak_bar := Rect2(middle_x + 19, panel_y + 119, col - 38, 5)
-	draw_rect(streak_bar, Color(0.05, 0.08, 0.22, 0.96), true)
 	var remaining := _speed_window_remaining(Time.get_ticks_msec())
 	var streak_fill := maxf(remaining, speed_intensity * 0.24) if speed_streak > 0 else 0.0
-	draw_rect(Rect2(streak_bar.position, Vector2(streak_bar.size.x * streak_fill, streak_bar.size.y)), Color(0.30, 0.88, 1.0, 0.70 + speed_intensity * 0.30), true)
-	var urgent_label := Color("b9dcff").lerp(Color("ff9a87"), urgent)
-	draw_string(ThemeDB.fallback_font, Vector2(right_x, panel_y + 30), "TIEMPO", HORIZONTAL_ALIGNMENT_CENTER, col, 16, urgent_label)
+	draw_string(ThemeDB.fallback_font, Vector2(middle_x, panel_y + 24), "SPEED  ·  RACHA", HORIZONTAL_ALIGNMENT_CENTER, speed_col, 14, Color("c8e9ff"))
+	var streak_label := "RACHA %02d" % speed_streak if speed_streak > 0 else "LISTO PARA RACHA"
+	draw_string(ThemeDB.fallback_font, Vector2(middle_x, panel_y + 45), streak_label, HORIZONTAL_ALIGNMENT_CENTER, speed_col, 12, streak_tint)
+	var medal_center := Vector2(speed_panel.get_center().x, panel_y + 91.0)
+	var medal_radius := 34.0 + speed_pulse * 2.0
+	draw_circle(medal_center + Vector2(0, 3), medal_radius + 4.0, Color(0.0, 0.0, 0.03, 0.72))
+	draw_circle(medal_center, medal_radius + 3.0, Color("8e6428"))
+	draw_arc(medal_center, medal_radius + 2.0, -PI * 0.82, PI * 1.18, 48, Color("ffe995"), 2.5 + speed_intensity * 1.2, true)
+	draw_circle(medal_center, medal_radius - 2.0, Color("12183a"))
+	draw_circle(medal_center - Vector2(0, 5), medal_radius * 0.72, Color(0.22, 0.36, 0.76, 0.45))
+	var multiplier_size := int(29 + speed_pulse * 4)
+	draw_string_outline(ThemeDB.fallback_font, Vector2(medal_center.x - 42, medal_center.y + 11), "x" + str(speed_multiplier), HORIZONTAL_ALIGNMENT_CENTER, 84, multiplier_size, 3, Color(0.04, 0.03, 0.18, 0.95))
+	draw_string(ThemeDB.fallback_font, Vector2(medal_center.x - 42, medal_center.y + 11), "x" + str(speed_multiplier), HORIZONTAL_ALIGNMENT_CENTER, 84, multiplier_size, streak_tint)
+	var meter := Rect2(middle_x + 14.0, panel_y + 136.0, speed_col - 28.0, 8.0)
+	var segment_gap := 3.0
+	var segment_width := (meter.size.x - segment_gap * 5.0) / 6.0
+	for segment in range(6):
+		var ratio := clampf(streak_fill * 6.0 - float(segment), 0.0, 1.0)
+		var segment_rect := Rect2(meter.position.x + segment * (segment_width + segment_gap), meter.position.y, segment_width, meter.size.y)
+		draw_rect(segment_rect, Color(0.035, 0.045, 0.12, 0.96), true)
+		if ratio > 0.0:
+			draw_rect(Rect2(segment_rect.position, Vector2(segment_rect.size.x * ratio, segment_rect.size.y)), Color(streak_tint.r, streak_tint.g, streak_tint.b, 0.6 + speed_intensity * 0.4), true)
+	var timer_col := timer_panel.size.x
+	var right_x := timer_panel.position.x
+	var urgent_label := Color("c5e8ff").lerp(Color("ff9a87"), urgent)
+	draw_string(ThemeDB.fallback_font, Vector2(right_x, panel_y + 24), "TIEMPO", HORIZONTAL_ALIGNMENT_CENTER, timer_col, 15, urgent_label)
 	var timer_alpha := 1.0 - urgent * 0.10 + urgent * pulse * 0.10
-	var timer_font_size := int(51 + urgent * pulse * 2.0)
-	draw_string_outline(ThemeDB.fallback_font, Vector2(right_x, panel_y + 92), "%02d" % int(ceil(seconds_left)), HORIZONTAL_ALIGNMENT_CENTER, col, timer_font_size, 5, Color(0.10, 0.03, 0.20, 0.96))
-	var timer_tint := Color("effaff").lerp(Color("ff6b7f"), urgent)
-	draw_string(ThemeDB.fallback_font, Vector2(right_x, panel_y + 92), "%02d" % int(ceil(seconds_left)), HORIZONTAL_ALIGNMENT_CENTER, col, timer_font_size, Color(timer_tint.r, timer_tint.g, timer_tint.b, timer_alpha))
+	var timer_font_size := int(44 + urgent * pulse * 3.0)
+	var timer_center := Vector2(timer_panel.get_center().x, panel_y + 91.0)
+	var timer_radius := 45.0 + urgent * pulse * 1.5
+	var timer_tint := Color("52e8ff").lerp(Color("ff5474"), urgent)
+	draw_arc(timer_center, timer_radius, -PI * 0.5, PI * 1.5, 56, Color(0.05, 0.07, 0.18, 0.98), 5.0, true)
+	draw_arc(timer_center, timer_radius, -PI * 0.5, -PI * 0.5 + TAU * _time_remaining_ratio(), 56, timer_tint, 4.0 + urgent * pulse, true)
+	draw_circle(timer_center + Vector2(0, 4), 32, Color(0.01, 0.015, 0.045, 0.58))
+	draw_string_outline(ThemeDB.fallback_font, Vector2(right_x, timer_center.y + 15), "%02d" % int(ceil(seconds_left)), HORIZONTAL_ALIGNMENT_CENTER, timer_col, timer_font_size, 5, Color(0.10, 0.03, 0.20, 0.96))
+	var number_tint := Color("effaff").lerp(Color("ff6b7f"), urgent)
+	draw_string(ThemeDB.fallback_font, Vector2(right_x, timer_center.y + 15), "%02d" % int(ceil(seconds_left)), HORIZONTAL_ALIGNMENT_CENTER, timer_col, timer_font_size, Color(number_tint.r, number_tint.g, number_tint.b, timer_alpha))
 	if combo_banner_age < 1.2 and chain_count > 1:
 		var enter := clampf(combo_banner_age / 0.16, 0.0, 1.0)
 		var leave := clampf((1.2 - combo_banner_age) / 0.24, 0.0, 1.0)
@@ -1671,6 +1697,22 @@ func _draw_hud() -> void:
 		draw_style_box(ui_hud_style, banner_rect)
 		draw_string_outline(ThemeDB.fallback_font, Vector2(0, banner_y), combo_banner, HORIZONTAL_ALIGNMENT_CENTER, size.x, banner_size, 6, Color(0.17, 0.04, 0.40, leave))
 		draw_string(ThemeDB.fallback_font, Vector2(0, banner_y), combo_banner, HORIZONTAL_ALIGNMENT_CENTER, size.x, banner_size, banner_color)
+
+
+func _draw_arcade_glass_panel(rect: Rect2, accent: Color, frame: Color, phase: float) -> void:
+	ui_hud_style.bg_color = Color(0.018, 0.026, 0.082, 0.94)
+	ui_hud_style.border_color = frame
+	ui_hud_style.shadow_color = Color(accent.r, accent.g, accent.b, 0.24)
+	ui_hud_style.shadow_size = 12
+	ui_hud_style.shadow_offset = Vector2(0, 5)
+	ui_hud_style.set_corner_radius_all(13)
+	ui_hud_style.set_border_width_all(2)
+	draw_style_box(ui_hud_style, rect)
+	draw_rect(Rect2(rect.position + Vector2(7, 6), Vector2(rect.size.x - 14, 2)), Color(accent.r, accent.g, accent.b, 0.45), true)
+	_draw_ornamental_frame(rect, frame, 6.0)
+	var t := fposmod(Time.get_ticks_msec() * 0.00027 + phase, 1.0)
+	var x := lerpf(rect.position.x + 12.0, rect.end.x - 12.0, t)
+	draw_line(Vector2(x - 11, rect.position.y + 5), Vector2(x + 10, rect.position.y + 5), Color(0.88, 0.98, 1.0, 0.22 * sin(t * PI)), 2.0, true)
 
 
 func _draw_hud_panel_glint(rect: Rect2, phase: float) -> void:
@@ -1690,24 +1732,16 @@ func _draw_ornamental_frame(rect: Rect2, tint: Color, inset: float) -> void:
 		draw_circle(p + Vector2(sx * inset, sy * inset), 1.8, Color(0.97, 0.89, 0.68, 0.78))
 
 
-func _player_rank_position() -> int:
-	var entries := _live_rank_entries()
-	for i in range(entries.size()):
-		if bool(entries[i]["player"]):
-			return i + 1
-	return entries.size()
-
-
 func _draw_timebar() -> void:
 	var g := _board_geometry()
 	var board_rect: Rect2 = g["rect"]
-	var bar := Rect2(board_rect.position + Vector2(0, board_rect.size.y + 9.0) + shake_offset * 0.35, Vector2(board_rect.size.x, float(CONFIG["TIMEBAR_HEIGHT"])))
-	var ratio := clampf(seconds_left / float(CONFIG["ROUND_SECONDS"]), 0.0, 1.0)
-	var urgency := clampf((10.0 - seconds_left) / 10.0, 0.0, 1.0)
+	var bar := Rect2(board_rect.position + Vector2(0, board_rect.size.y + 9.0) + shake_offset * 0.35, Vector2(board_rect.size.x, float(CONFIG["TIMEBAR_HEIGHT"]) + 5.0))
+	var ratio := _time_remaining_ratio()
+	var urgency := _timer_urgency()
 	var pulse := 0.5 + 0.5 * sin(Time.get_ticks_msec() * 0.001 * lerpf(2.6, 8.0, urgency))
 	var tint := Color("47eaff").lerp(Color("ff557e"), urgency)
 	var alpha := 0.88 + urgency * pulse * 0.12
-	draw_rect(bar.grow(4.0), Color(0.008, 0.009, 0.025, 0.94), true)
+	draw_rect(bar.grow(5.0), Color(0.008, 0.009, 0.025, 0.94), true)
 	draw_rect(bar, Color(0.025, 0.026, 0.057, 0.98), true)
 	if ratio > 0.0:
 		var fill := Rect2(bar.position, Vector2(bar.size.x * ratio, bar.size.y))
@@ -1717,6 +1751,20 @@ func _draw_timebar() -> void:
 		draw_line(Vector2(sheen_x - 12, bar.position.y + 2), Vector2(sheen_x + 8, bar.end.y - 2), Color(1, 1, 1, 0.46), 3.0, true)
 	draw_rect(bar, Color("c4a36a").lerp(Color("ff8d80"), urgency * pulse * 0.65), false, 1.6, true)
 	_draw_ornamental_frame(bar.grow(4.0), Color("c5a873"), 5.0)
+
+
+func _time_remaining_ratio() -> float:
+	return clampf(seconds_left / float(CONFIG["ROUND_SECONDS"]), 0.0, 1.0)
+
+
+func _timer_urgency() -> float:
+	if seconds_left > 15.0:
+		return 0.0
+	if seconds_left > 10.0:
+		return lerpf(0.04, 0.22, clampf((15.0 - seconds_left) / 4.0, 0.0, 1.0))
+	if seconds_left > 5.0:
+		return lerpf(0.22, 0.66, clampf((10.0 - seconds_left) / 5.0, 0.0, 1.0))
+	return lerpf(0.66, 1.0, clampf((5.0 - seconds_left) / 5.0, 0.0, 1.0))
 
 
 func _draw_countdown_overlay() -> void:
@@ -1767,18 +1815,19 @@ func _draw_board() -> void:
 	var tile: float = float(g["tile"])
 	var origin: Vector2 = Vector2(g["origin"]) + shake_offset
 	var board_rect: Rect2 = Rect2(origin, Vector2(tile * int(CONFIG["COLS"]), tile * int(CONFIG["ROWS"])))
-	draw_style_box(ui_board_style, board_rect.grow(10))
+	draw_style_box(ui_board_style, board_rect.grow(11))
+	draw_rect(board_rect, Color(0.006, 0.003, 0.018, 0.94), true)
 	if speed_intensity > 0.02:
 		var glow_tint := Color("2bcaff").lerp(Color("b763ff"), speed_intensity * 0.72)
 		draw_rect(board_rect.grow(13.0), Color(glow_tint.r, glow_tint.g, glow_tint.b, speed_intensity * 0.13), false, 2.0 + speed_intensity * 2.0, true)
-	draw_rect(board_rect.grow(4), Color(0.58, 0.43, 0.25, 0.72), false, 1.4, true)
-	draw_rect(board_rect.grow(7), Color(0.31, 0.58, 0.81, 0.24), false, 1.0, true)
-	draw_line(board_rect.position + Vector2(18, -3), board_rect.position + Vector2(board_rect.size.x - 18, -3), Color(0.86, 0.70, 0.43, 0.32), 1.4, true)
+	draw_rect(board_rect.grow(4), Color(0.66, 0.48, 0.20, 0.82), false, 1.8, true)
+	draw_rect(board_rect.grow(7), Color(0.28, 0.61, 0.86, 0.20), false, 1.0, true)
+	draw_line(board_rect.position + Vector2(18, -4), board_rect.position + Vector2(board_rect.size.x - 18, -4), Color(1.0, 0.82, 0.48, 0.54), 2.0, true)
 	for y in range(int(CONFIG["ROWS"])):
 		for x in range(int(CONFIG["COLS"])):
 			var c := Vector2i(x, y)
 			var rect := Rect2(origin + Vector2(x * tile, y * tile), Vector2(tile, tile))
-			var cell_color := Color(0.008, 0.010, 0.022, 0.34) if (x + y) % 2 == 0 else Color(0.006, 0.008, 0.018, 0.28)
+			var cell_color := Color(0.008, 0.010, 0.022, 0.19) if (x + y) % 2 == 0 else Color(0.006, 0.008, 0.018, 0.13)
 			draw_rect(rect.grow(-1.5), cell_color, true)
 			var inset := 6.0
 			if c == selected:
@@ -1901,7 +1950,7 @@ func _draw_gem(center: Vector2, r: float, color_id: int, special: String, stretc
 	if gem_atlas != null and color_id >= 0:
 		var index: int = GEM_SPRITE_INDEX[posmod(color_id, GEM_SPRITE_INDEX.size())]
 		var source := Rect2(Vector2((index % 3) * 512, int(index / 3) * 512), Vector2(512, 512))
-		var extent := r * 2.34
+		var extent := r * GEM_ATLAS_DRAW_SCALE
 		var destination := Rect2(center - Vector2(extent, extent) * stretch * 0.5, Vector2(extent, extent) * stretch)
 		draw_texture_rect_region(gem_atlas, destination, source, Color.WHITE, false, true)
 		if special != "":
@@ -2006,15 +2055,11 @@ func _gem_points(c: Vector2, r: float, shape: int) -> PackedVector2Array:
 			pts = PackedVector2Array([c+Vector2(0,-0.94*r),c+Vector2(0.61*r,-0.68*r),c+Vector2(0.83*r,-0.20*r),c+Vector2(0.69*r,0.57*r),c+Vector2(0,0.88*r),c+Vector2(-0.69*r,0.57*r),c+Vector2(-0.83*r,-0.20*r),c+Vector2(-0.61*r,-0.68*r)])
 		2: # emerald: clipped rectangular step cut
 			pts = PackedVector2Array([c+Vector2(-0.62*r,-0.86*r),c+Vector2(0.62*r,-0.86*r),c+Vector2(0.86*r,-0.62*r),c+Vector2(0.86*r,0.62*r),c+Vector2(0.62*r,0.86*r),c+Vector2(-0.62*r,0.86*r),c+Vector2(-0.86*r,0.62*r),c+Vector2(-0.86*r,-0.62*r)])
-		3: # citrine: oval brilliant cut
-			for i in range(12):
-				var angle := -PI / 2.0 + TAU * float(i) / 12.0
-				pts.append(c + Vector2(cos(angle) * r * 0.78, sin(angle) * r * 0.90))
-		4: # amethyst: round brilliant cut, no star points
-			for i in range(12):
-				var angle := -PI / 2.0 + TAU * float(i) / 12.0
-				pts.append(c + Vector2(cos(angle), sin(angle)) * r * (0.88 if i % 2 == 0 else 0.82))
-		5: # opal: hexagonal crystal cut
+		3: # topaz: clean rhombus cut
+			pts = PackedVector2Array([c+Vector2(0,-0.94*r),c+Vector2(0.68*r,-0.20*r),c+Vector2(0.68*r,0.20*r),c+Vector2(0,0.94*r),c+Vector2(-0.68*r,0.20*r),c+Vector2(-0.68*r,-0.20*r)])
+		4: # amethyst: softened triangular cut
+			pts = PackedVector2Array([c+Vector2(0,-0.92*r),c+Vector2(0.82*r,0.56*r),c+Vector2(0.68*r,0.84*r),c+Vector2(-0.68*r,0.84*r),c+Vector2(-0.82*r,0.56*r)])
+		5: # citrine: hexagonal crystal cut
 			pts = PackedVector2Array([c+Vector2(-0.48*r,-0.84*r),c+Vector2(0.48*r,-0.84*r),c+Vector2(0.89*r,-0.13*r),c+Vector2(0.60*r,0.76*r),c+Vector2(-0.60*r,0.76*r),c+Vector2(-0.89*r,-0.13*r)])
 	return pts
 
@@ -2057,10 +2102,20 @@ func _draw_effects() -> void:
 		particle_color.a = alpha
 		if bool(p.get("shard", false)):
 			var pos: Vector2 = Vector2(p["pos"])
-			var heading := Vector2(p["vel"]).angle()
-			var shard_r := float(p["radius"]) * alpha
-			var shard := PackedVector2Array([pos + Vector2(cos(heading), sin(heading)) * shard_r * 1.6, pos + Vector2(cos(heading + 2.4), sin(heading + 2.4)) * shard_r, pos + Vector2(cos(heading - 2.4), sin(heading - 2.4)) * shard_r])
-			draw_colored_polygon(shard, particle_color)
+			var velocity: Vector2 = Vector2(p["vel"])
+			var shard_r: float = float(p["radius"]) * alpha
+			
+			if shard_r > 0.1 and velocity.length_squared() > 0.001:
+				var direction: Vector2 = velocity.normalized()
+				var shard_start: Vector2 = pos - direction * shard_r
+				var shard_end: Vector2 = pos + direction * shard_r * 1.6
+				draw_line(
+					shard_start,
+					shard_end,
+					particle_color,
+					maxf(1.0, shard_r * 0.65),
+					true
+				)
 		else:
 			draw_circle(Vector2(p["pos"]), float(p["radius"]) * alpha, particle_color)
 	for f in floaters:
@@ -2165,63 +2220,86 @@ func _cells_center(cells: Array) -> Vector2:
 
 
 func _draw_game_footer() -> void:
-	_draw_live_ranking()
-	_draw_text_center("DESLIZÁ PARA MOVER  •  O TOCÁ DOS GEMAS VECINAS", size.y * 0.91, 15, Color("b9d9ff"))
-	restart_button_rect = Rect2(size.x * 0.12, size.y - 72.0, size.x * 0.38, 44.0)
-	exit_button_rect = Rect2(size.x * 0.54, size.y - 72.0, size.x * 0.34, 44.0)
-	_draw_button(restart_button_rect, "REINICIAR", Color("607bd0"), Color("273569"), 17)
-	_draw_button(exit_button_rect, "SALIR", Color("665777"), Color("2e2543"), 17)
+	_draw_competitive_target()
+	_draw_text_center("DESLIZÁ PARA MOVER  •  O TOCÁ DOS GEMAS VECINAS", size.y * 0.91, 14, Color("e3ddff"))
+	var margin := 18.0
+	var gap := 14.0
+	var button_width := (size.x - margin * 2.0 - gap) * 0.5
+	var row_y := size.y - 78.0
+	restart_button_rect = Rect2(margin, row_y, button_width, 54.0)
+	exit_button_rect = Rect2(restart_button_rect.end.x + gap, row_y, button_width, 54.0)
+	_draw_button(restart_button_rect, "REINICIAR", Color("ec4d9d"), Color("722c86"), 18)
+	_draw_button(exit_button_rect, "SALIR", Color("27c9ec"), Color("1d4f91"), 18)
 
 
-func _ranking_panel_rect() -> Rect2:
+func _competitive_target_rect() -> Rect2:
 	var board_rect: Rect2 = _board_geometry()["rect"]
 	var width := minf(size.x - 60.0, 560.0)
-	var height := 148.0
+	var height := 126.0
 	var x := (size.x - width) * 0.5
-	var y := board_rect.end.y + 9.0 + float(CONFIG["TIMEBAR_HEIGHT"]) + 14.0
+	var y := board_rect.end.y + 9.0 + float(CONFIG["TIMEBAR_HEIGHT"]) + 19.0
 	return Rect2(x, y, width, height)
 
 
-func _live_rank_entries() -> Array[Dictionary]:
-	var elapsed := 0.0
-	if game_state == "playing":
-		elapsed = clampf(float(CONFIG["ROUND_SECONDS"]) - seconds_left, 0.0, float(CONFIG["ROUND_SECONDS"]))
-	var progress := elapsed / float(CONFIG["ROUND_SECONDS"])
-	var entries: Array[Dictionary] = [{"name": "VOS", "score": score, "player": true}]
-	for rival in CONFIG["LOCAL_RIVALS"]:
-		var rival_progress := clampf(progress * float(rival["pace"]), 0.0, 1.0)
-		var rival_score := int(float(rival["finish_score"]) * pow(rival_progress, 1.12))
-		entries.append({"name": str(rival["name"]), "score": rival_score, "player": false})
-	entries.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
-		if int(a["score"]) == int(b["score"]):
-			return bool(a["player"]) and not bool(b["player"])
-		return int(a["score"]) > int(b["score"])
-	)
-	return entries
+func _player_position_label() -> String:
+	var player_position := int(round_target.get("player_position", 0))
+	return "#%d SEMANAL" % player_position if player_position > 0 else ""
 
 
-func _draw_live_ranking() -> void:
-	var panel := _ranking_panel_rect()
-	draw_style_box(ui_hud_style, panel)
-	_draw_ornamental_frame(panel, Color("ae9567"), 8.0)
-	draw_string(ThemeDB.fallback_font, Vector2(panel.position.x + 16.0, panel.position.y + 23.0), "CLASIFICACIÓN", HORIZONTAL_ALIGNMENT_LEFT, -1, 15, Color("c9e4ff"))
-	draw_string(ThemeDB.fallback_font, Vector2(panel.position.x, panel.position.y + 23.0), "RIVALES LOCALES · DEMO", HORIZONTAL_ALIGNMENT_RIGHT, panel.size.x - 15.0, 11, Color("8ea9da"))
-	var entries := _live_rank_entries()
-	var row_top := panel.position.y + 31.0
-	var row_height := 27.0
-	var medal_colors := [Color("ffe58a"), Color("d4e6ff"), Color("e9a879"), Color("93cfff")]
-	for i in range(entries.size()):
-		var row := Rect2(panel.position.x + 9.0, row_top + i * row_height, panel.size.x - 18.0, row_height - 2.0)
-		var entry: Dictionary = entries[i]
-		var is_player := bool(entry["player"])
-		if is_player:
-			draw_rect(row, Color(0.08, 0.52, 0.82, 0.34), true)
-			draw_rect(row, Color("57e7ff"), false, 1.1, true)
-		var label_color: Color = Color("f2fbff") if is_player else Color("b9cce9")
-		var rank_color: Color = medal_colors[i] if i < medal_colors.size() else Color("b9cce9")
-		draw_string(ThemeDB.fallback_font, Vector2(row.position.x + 9.0, row.position.y + 18.0), str(i + 1) + "º", HORIZONTAL_ALIGNMENT_LEFT, 30.0, 14, rank_color)
-		draw_string(ThemeDB.fallback_font, Vector2(row.position.x + 44.0, row.position.y + 18.0), str(entry["name"]), HORIZONTAL_ALIGNMENT_LEFT, 120.0, 15, label_color)
-		draw_string(ThemeDB.fallback_font, Vector2(row.position.x + 100.0, row.position.y + 18.0), _format_score(int(entry["score"])), HORIZONTAL_ALIGNMENT_RIGHT, row.size.x - 112.0, 15, label_color)
+func _draw_competitive_target() -> void:
+	var panel := _competitive_target_rect()
+	var completed := round_target_completed
+	var frame_color := Color("75f0ff") if completed else Color("ddb968")
+	_draw_arcade_glass_panel(panel, Color("b35fff") if not completed else Color("61eaff"), frame_color, 0.82)
+	var target_mode := str(round_target.get("mode", "local_record"))
+	var title := "SUPERÁ TU RÉCORD"
+	if target_mode == "rival" or target_mode == "top25":
+		title = "PUNTAJE A SUPERAR"
+	if round_target_pending and game_state == "countdown":
+		title = "BUSCANDO OBJETIVO SEMANAL…"
+	var title_color := Color("ffe27a") if completed else Color("9deaff")
+	draw_string(ThemeDB.fallback_font, Vector2(panel.position.x + 18.0, panel.position.y + 25.0), title, HORIZONTAL_ALIGNMENT_LEFT, panel.size.x - 36.0, 16, title_color)
+	var name_color := Color("ffffff") if completed else Color("f3d9ff")
+	var target_name := str(round_target.get("name", "RÉCORD LOCAL"))
+	var crown_center := Vector2(panel.position.x + 27.0, panel.position.y + 49.0)
+	draw_colored_polygon(PackedVector2Array([crown_center + Vector2(-11, 5), crown_center + Vector2(-9, -5), crown_center + Vector2(-3, 0), crown_center + Vector2(0, -9), crown_center + Vector2(4, 0), crown_center + Vector2(10, -5), crown_center + Vector2(11, 5)]), Color("ffd46f"))
+	draw_rect(Rect2(crown_center + Vector2(-10, 6), Vector2(20, 3)), Color("ffeaa2"), true)
+	draw_string_outline(ThemeDB.fallback_font, Vector2(panel.position.x + 46.0, panel.position.y + 58.0), target_name, HORIZONTAL_ALIGNMENT_LEFT, panel.size.x * 0.49, 22, 3, Color(0.03, 0.04, 0.18, 0.92))
+	draw_string(ThemeDB.fallback_font, Vector2(panel.position.x + 47.0, panel.position.y + 57.0), target_name, HORIZONTAL_ALIGNMENT_LEFT, panel.size.x * 0.49, 21, name_color)
+	var target_value := _format_score(_competitive_target_display_score())
+	draw_string_outline(ThemeDB.fallback_font, Vector2(panel.position.x + panel.size.x - 16.0, panel.position.y + 58.0), target_value, HORIZONTAL_ALIGNMENT_RIGHT, panel.size.x * 0.37 - 16.0, 22, 3, Color(0.03, 0.04, 0.18, 0.92))
+	draw_string(ThemeDB.fallback_font, Vector2(panel.position.x + panel.size.x - 17.0, panel.position.y + 57.0), target_value, HORIZONTAL_ALIGNMENT_RIGHT, panel.size.x * 0.37 - 16.0, 21, Color("fff0a7"))
+	draw_line(panel.position + Vector2(16.0, 69.0), Vector2(panel.end.x - 16.0, panel.position.y + 69.0), Color(0.55, 0.75, 0.98, 0.28), 1.0, true)
+	draw_string(ThemeDB.fallback_font, Vector2(panel.position.x + 17.0, panel.position.y + 94.0), "TU PUNTAJE", HORIZONTAL_ALIGNMENT_LEFT, panel.size.x * 0.45, 15, Color("bce9ff"))
+	draw_string_outline(ThemeDB.fallback_font, Vector2(panel.end.x - 17.0, panel.position.y + 95.0), _format_score(score), HORIZONTAL_ALIGNMENT_RIGHT, panel.size.x * 0.48, 17, 3, Color(0.03, 0.04, 0.18, 0.92))
+	draw_string(ThemeDB.fallback_font, Vector2(panel.end.x - 18.0, panel.position.y + 94.0), _format_score(score), HORIZONTAL_ALIGNMENT_RIGHT, panel.size.x * 0.48, 16, Color("fff8d2"))
+
+
+func _competitive_target_display_score() -> int:
+	if str(round_target.get("mode", "local_record")) == "local_record":
+		return int(round_target.get("reference_score", round_target.get("target_score", 1)))
+	return int(round_target.get("target_score", 1))
+
+
+func _update_competitive_target_completion() -> void:
+	if round_target_completed or round_target.is_empty():
+		return
+	if not bool(COMPETITIVE_TARGET.is_reached(round_target, score)):
+		return
+	round_target_completed = true
+	speed_pulse = 1.0
+	var panel := _competitive_target_rect()
+	_float_text(str(COMPETITIVE_TARGET.completion_message(round_target)), Vector2(panel.get_center().x, panel.position.y + 39.0), Color("fff18b"), true)
+	queue_redraw()
+
+
+func _on_round_target_loaded(request_generation: int, success: bool, data: Variant, _message: String) -> void:
+	if request_generation != round_target_request_generation or game_state != "countdown" or round_target_locked:
+		return
+	var entries: Array = data if data is Array else []
+	round_target = COMPETITIVE_TARGET.from_snapshot(entries, success and data is Array, best_score)
+	round_target_pending = false
+	queue_redraw()
 
 
 func _draw_result() -> void:
@@ -2473,7 +2551,26 @@ func _chain_color(chain: int) -> Color:
 func _make_stars() -> void:
 	stars.clear()
 	for i in range(72):
-		stars.append({"pos": Vector2(randf() * 720.0, randf() * 1280.0), "radius": randf_range(0.7, 2.5), "alpha": randf_range(0.15, 0.65), "phase": randf_range(0.0, TAU)})
+		var pos := Vector2(randf() * 720.0, randf() * 1280.0)
+		var radius := randf_range(0.7, 2.5)
+		var star := {"pos": pos, "radius": radius, "alpha": randf_range(0.15, 0.65), "phase": randf_range(0.0, TAU)}
+		# Sparkle geometry never moves or changes size. Build these packed arrays
+		# once instead of allocating 18 temporary arrays on every _draw().
+		if i % 8 == 0:
+			var sparkle_radius := radius * 2.0
+			star["sparkle_vertical"] = PackedVector2Array([
+				pos + Vector2(0.0, -sparkle_radius),
+				pos + Vector2(sparkle_radius * 0.20, 0.0),
+				pos + Vector2(0.0, sparkle_radius),
+				pos + Vector2(-sparkle_radius * 0.20, 0.0),
+			])
+			star["sparkle_horizontal"] = PackedVector2Array([
+				pos + Vector2(-sparkle_radius, 0.0),
+				pos,
+				pos + Vector2(sparkle_radius, 0.0),
+				pos + Vector2(0.0, sparkle_radius * 0.20),
+			])
+		stars.append(star)
 
 
 func _begin_swap_visual(a: Vector2i, b: Vector2i, bounce_back := false) -> void:

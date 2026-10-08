@@ -30,7 +30,7 @@ Todos los parámetros de partida están al comienzo de `scripts/game.gd`, en `CO
 
 - `ROUND_SECONDS`: duración.
 - `COUNTDOWN_STEP_SEC`, `COUNTDOWN_GO_SEC`, `COUNTDOWN_FONT_SIZE`: ritmo de 3–2–1–¡YA! y tamaño del impacto. El reloj, los controles y la música se activan juntos al aparecer ¡YA!.
-- `LOCAL_RIVALS`: perfiles de puntuación simulados que alimentan la clasificación visible durante la partida; no son jugadores online.
+- `COMPETITIVE_TARGET` se determina en `scripts/competitive_target.gd`; `game.gd` solicita una única instantánea semanal al iniciar una partida y la congela al aparecer ¡YA!.
 - `ROWS`, `COLS`, `GEM_TYPES`: tablero y colores.
 - `POINTS_PER_GEM`, `SPECIAL_CREATE_BONUS`, `SPECIAL_ACTIVATE_BONUS`, `CHAIN_SCORE_CAP`: puntuación.
 - `SWAP_TIME`, `CLEAR_TIME`: duración del intercambio y del brillo/ruptura. El umbral de drag táctil se calcula como el 22% del tamaño de una casilla en `_drag_direction()`.
@@ -72,8 +72,8 @@ Los colores están en `GEM_COLORS`, su correspondencia en `GEM_SPRITE_INDEX`, el
 - Los matches de caída aumentan el multiplicador visual sin límite; el multiplicador matemático de puntaje se limita por `CHAIN_SCORE_CAP`.
 - SPEED registra solo combinaciones iniciadas por movimientos manuales válidos. Su ventana, multiplicador de puntos, escala musical, glow y decay se configuran de forma independiente; las cascadas conservan su contador y feedback propios.
 - El récord se guarda localmente en `user://glint_rush.cfg`.
-- Al pulsar JUGAR se crea el tablero y corre 3–2–1–¡YA! sobre él. No se aceptan movimientos durante los tres números; el reloj de 60 segundos, la música y el input arrancan al mismo tiempo que ¡YA!.
-- La clasificación de la partida muestra tu puntaje frente a tres rivales locales de demostración. Sus nombres y ritmo final se editan en `LOCAL_RIVALS`; la lista no consulta ningún servidor.
+- Al pulsar JUGAR se crea el tablero, se solicita una instantánea del ranking y corre 3–2–1–¡YA! sobre él. No se aceptan movimientos durante los tres números; el reloj de 60 segundos, la música y el input arrancan al mismo tiempo que ¡YA!.
+- Durante la partida, el panel bajo el tablero muestra el objetivo competitivo tomado antes del inicio (rival inmediato, corte del Top 25 o récord semanal) y calcula localmente cuánto falta; la posición mostrada en el HUD superior sale del mismo snapshot. La lista ficticia de rivales se eliminó. Si el ranking no está disponible, se usa el récord personal local sin bloquear el juego.
 
 ## Assets temporales
 
@@ -81,7 +81,7 @@ El atlas de seis gemas, el prisma y los tres fondos son ilustraciones originales
 
 ## Límites de validación
 
-Las pruebas de lógica cubren generación del tablero, countdown, input bloqueado, reloj, ranking local, ranking online (respuestas obsoletas y filtrado de campos), volver al menú, score local sin sesión, intercambio inválido, caída, especiales, cascadas, SPEED y Final Blast. El smoke test está en `tests/smoke_test.gd`; las pruebas SQL de Phase 6 en `supabase/tests/database/phase6_competitive.test.sql`. En este entorno no hay ejecutable Godot, `psql`, Supabase CLI ni Android SDK/ADB, así que esas pruebas y la exportación Android quedan pendientes de ejecutar.
+Las pruebas de lógica cubren generación del tablero, countdown, input bloqueado, reloj, objetivos de temporada (Top 25, corte #25 y #1), objetivo superado, snapshot tardío ignorado, fallback local/offline, ranking online (respuestas obsoletas y filtrado de campos), volver al menú, score local sin sesión, intercambio inválido, caída, especiales, cascadas, SPEED y Final Blast. El smoke test está en `tests/smoke_test.gd`; las pruebas SQL de Phase 6 en `supabase/tests/database/phase6_competitive.test.sql`. En este entorno no hay ejecutable Godot, `psql`, Supabase CLI ni Android SDK/ADB, así que esas pruebas y la exportación Android quedan pendientes de ejecutar.
 
 ## Fase 5 — UX y game feel
 

@@ -1,6 +1,7 @@
 extends SceneTree
 
 const ONLINE_CONTRACT = preload("res://scripts/online_contract.gd")
+const COMPETITIVE_TARGET = preload("res://scripts/competitive_target.gd")
 
 
 func _initialize() -> void:
@@ -9,6 +10,7 @@ func _initialize() -> void:
 
 func _run() -> void:
 	OS.set_environment("GLINT_RUSH_TEST", "1")
+	_test_competitive_targets()
 	var scene: PackedScene = load("res://scenes/main.tscn")
 	var game: Control = scene.instantiate()
 	game.size = Vector2(720, 1280)
@@ -54,10 +56,22 @@ func _run() -> void:
 	assert(score_submission_updates.size() == 1 and score_submission_updates[0]["state"] == "local", "a round without authenticated identity must remain local and must not send a score")
 	var auth_source := FileAccess.get_file_as_string("res://scripts/services/auth_service.gd")
 	assert(auth_source.contains("has_java_method(") and not auth_source.contains("_bridge.has_method("), "Android auth bridge must keep Java method checks")
+	var game_source := FileAccess.get_file_as_string("res://scripts/game.gd")
+	assert(not game_source.contains("LOCAL_RIVALS") and not game_source.contains("_live_rank_entries"), "active gameplay must not retain the fictitious rival table")
+	assert(game_source.count("OnlineService.fetch_weekly_leaderboard(25, round_target_request_generation)") == 1, "the target should make one leaderboard call from round start and none from the per-frame loop")
 	assert(game.gem_atlas != null, "transparent gem atlas should load")
+	assert(game.gem_atlas.get_width() == 1536 and game.gem_atlas.get_height() == 1024, "the new atlas should retain the expected 3 by 2 cells")
 	assert(game.prism_texture != null, "the original prism core sprite should load")
 	assert(game.background_textures.size() == 3, "three original fantasy arenas should be available to rotate")
-	assert(ResourceLoader.exists("res://assets/gems/gem_atlas.png"), "the six-gem material atlas should be bundled")
+	assert(ResourceLoader.exists("res://assets/backgrounds/glint_arena.jpg"), "the hybrid arcade arena backdrop should be bundled")
+	assert(game.stars.size() == 72, "ambient star field should retain its original count")
+	for star_index in range(0, game.stars.size(), 8):
+		var star: Dictionary = game.stars[star_index]
+		assert(star.get("sparkle_vertical", PackedVector2Array()).size() == 4, "cached vertical sparkle geometry should be initialized")
+		assert(star.get("sparkle_horizontal", PackedVector2Array()).size() == 4, "cached horizontal sparkle geometry should be initialized")
+	assert(ResourceLoader.exists("res://assets/gems/arcade_gem_atlas.png"), "the six new arcade gems should be bundled in the runtime atlas")
+	for gem_name in ["ruby_red", "sapphire_blue", "emerald_green", "topaz_yellow", "amethyst_violet", "citrine_orange"]:
+		assert(ResourceLoader.exists("res://assets/gems/arcade/" + gem_name + ".png"), "each new gem source sprite should be bundled: " + gem_name)
 	assert(ResourceLoader.exists("res://assets/gems/prism_core.png"), "the multicolor prism art should be bundled")
 	assert(is_equal_approx(float(game.call("_fall_ease", 0.0)), 0.0), "fall easing should start at the source")
 	assert(is_equal_approx(float(game.call("_fall_ease", 1.0, 4)), 1.0), "fall easing should settle exactly at the target")
@@ -100,8 +114,49 @@ func _run() -> void:
 	assert(game.board[0].size() == 8, "new round should create 8 columns")
 	assert(game.call("_find_groups").is_empty(), "initial board should not start with a match")
 	assert(game.call("_has_valid_move"), "initial board should have a legal move")
-	var countdown_entries: Array = game.call("_live_rank_entries")
-	assert(countdown_entries.size() == 4 and countdown_entries[0]["name"] == "VOS", "the live demo table should include the player and three local rivals")
+	var target_generation: int = game.round_target_request_generation
+	var weekly_snapshot := [
+		{"position": 1, "handle": "nova", "best_score": 300000, "is_me": false},
+		{"position": 6, "handle": "mateo", "best_score": 215000, "is_me": false},
+		{"position": 7, "handle": "hory", "best_score": 180000, "is_me": true},
+	]
+	game.call("_on_round_target_loaded", target_generation, true, weekly_snapshot, "")
+	assert(game.round_target["mode"] == "rival" and game.round_target["name"] == "@mateo", "a Top 25 player should target the immediately higher player")
+	assert(game.call("_player_position_label") == "#7 SEMANAL", "the in-game HUD should show a compact valid weekly position")
+	assert(game.round_target["target_score"] == 215001 and not game.round_target_locked, "the competitive target should use the pre-round snapshot and require a strict overtake")
+	var timer_seconds_before: float = game.seconds_left
+	game.seconds_left = 60.0
+	assert(is_equal_approx(float(game.call("_time_remaining_ratio")), 1.0), "the time bar/ring should be full at sixty seconds")
+	assert(is_equal_approx(float(game.call("_timer_urgency")), 0.0), "the timer should have no urgency before the final fifteen seconds")
+	game.seconds_left = 30.0
+	assert(is_equal_approx(float(game.call("_time_remaining_ratio")), 0.5), "the time bar/ring should be half full at thirty seconds")
+	game.seconds_left = 15.0
+	assert(is_equal_approx(float(game.call("_timer_urgency")), 0.04), "visual urgency should begin subtly at fifteen seconds")
+	game.seconds_left = 10.0
+	assert(is_equal_approx(float(game.call("_timer_urgency")), 0.22), "visual urgency should rise at ten seconds")
+	game.seconds_left = 5.0
+	assert(is_equal_approx(float(game.call("_timer_urgency")), 0.66), "visual urgency should pulse strongly in the final five seconds")
+	game.seconds_left = 0.0
+	assert(is_equal_approx(float(game.call("_time_remaining_ratio")), 0.0), "the time bar/ring should be empty at zero")
+	assert(is_equal_approx(float(game.call("_timer_urgency")), 1.0), "the timer should reach full visual urgency at zero")
+	game.seconds_left = timer_seconds_before
+	var current_target: Dictionary = game.round_target
+	assert(int(game.call("_competitive_target_display_score")) == 215001, "the rival panel should display the strict score required to pass")
+	game.round_target = COMPETITIVE_TARGET.local_fallback(220800)
+	assert(str(game.call("_player_position_label")).is_empty(), "offline/local fallback should not print a rank status in the HUD")
+	assert(int(game.call("_competitive_target_display_score")) == 220800, "the offline target panel should display the local record, not its internal +1 threshold")
+	game.round_target = current_target
+	game.call("_draw_hud")
+	game.call("_draw_board")
+	game.call("_draw_timebar")
+	game.call("_draw_game_footer")
+	assert(game.restart_button_rect.size.x > 0.0 and game.exit_button_rect.size.x > 0.0, "the footer should keep restart and exit hit areas")
+	assert(is_equal_approx(game.restart_button_rect.size.x, game.exit_button_rect.size.x), "restart and exit controls should be symmetric")
+	var visual_source := FileAccess.get_file_as_string("res://scripts/game.gd")
+	assert(visual_source.contains("TU PUNTAJE") and visual_source.contains("PUNTAJE A SUPERAR"), "competitive target UI should show the current score and the appropriate target label")
+	assert(not visual_source.contains("TE FALTAN") and not visual_source.contains("objective_ratio"), "competitive target UI should not show the difference or a target progress bar")
+	assert(not visual_source.contains("PAUSA") and not visual_source.contains("pause_slot"), "there should be no voluntary pause control during a round")
+	assert(visual_source.contains("arcade_gem_atlas.png"), "gameplay should load the new six-gem atlas")
 	var countdown_move := _find_move(game)
 	var countdown_board: Array = game.board.duplicate(true)
 	game.call("_attempt_swap", countdown_move[0], countdown_move[1])
@@ -114,14 +169,15 @@ func _run() -> void:
 	assert(game.countdown_label == "¡YA!" and game.game_state == "playing", "GO should transition directly into the live round")
 	assert(not game.input_locked and game.seconds_left == 60.0, "input and the untouched 60 second timer should start with GO")
 	assert(game.deadline_msec == game.countdown_label_started_msec + 60000, "the 60 second deadline should begin on the GO cue")
-	var rank_saved_score: int = game.score
-	var rank_saved_time: float = game.seconds_left
-	game.score = 30000
-	game.seconds_left = 30.0
-	var updated_entries: Array = game.call("_live_rank_entries")
-	assert(updated_entries[0]["name"] == "VOS", "the live ranking should immediately reflect the player's score")
-	game.score = rank_saved_score
-	game.seconds_left = rank_saved_time
+	assert(game.round_target_locked, "the target snapshot should be locked at GO")
+	game.call("_on_round_target_loaded", target_generation, true, [{"position": 1, "handle": "late", "best_score": 999999, "is_me": false}], "")
+	assert(game.round_target["name"] == "@mateo", "a late ranking response must not change the in-round target")
+	var score_before_goal: int = game.score
+	game.score = int(game.round_target["target_score"])
+	game.call("_update_competitive_target_completion")
+	assert(game.round_target_completed and COMPETITIVE_TARGET.completion_message(game.round_target) == "¡OBJETIVO SUPERADO!", "overtaking the immediate leader should show a non-final objective message")
+	game.score = score_before_goal
+	game.round_target_completed = false
 	var before_invalid: Array = game.board.duplicate(true)
 	var invalid_move := _find_invalid_move(game)
 	assert(invalid_move.size() == 2, "test should locate an invalid swap")
@@ -413,7 +469,7 @@ func _run() -> void:
 	assert(local_record_cfg.load("user://glint_rush.cfg") == OK, "the existing local record file should still be saved")
 	assert(int(local_record_cfg.get_value("local", "best", 0)) == game.best_score, "the saved local best should remain authoritative for the local record")
 
-	print("SMOKE TEST PASS: generation, touch drag direction/threshold, gesture guards, countdown/GO, local demo ranking, online leaderboard response generation/privacy filtering, result-to-menu cleanup, authenticated-score offline fallback, local scoring/record, match IDs/events, 4/5/T/L specials, old-special activation with preserved new-special creation, full cross and chain reaction, deterministic Prisma conversions, Prisma pair/color clear, SPEED streak/pitch/expiry, restart cancellation, timeout settlement, Final Blast/no-special finish/final scoring")
+	print("SMOKE TEST PASS: generation, touch drag direction/threshold, gesture guards, countdown/GO, competitive target selection/fallback/provisional states/late-response lock, online leaderboard response generation/privacy filtering, result-to-menu cleanup, authenticated-score offline fallback, local scoring/record, match IDs/events, 4/5/T/L specials, old-special activation with preserved new-special creation, full cross and chain reaction, deterministic Prisma conversions, Prisma pair/color clear, SPEED streak/pitch/expiry, restart cancellation, timeout settlement, Final Blast/no-special finish/final scoring")
 	game.music_player.stop()
 	game.music_player.stream = null
 	for player in game.sfx_players:
@@ -473,3 +529,41 @@ func _advance_countdown_boundary(game: Control) -> void:
 func _skip_start_countdown(game: Control) -> void:
 	for i in range(3):
 		_advance_countdown_boundary(game)
+
+
+func _test_competitive_targets() -> void:
+	var top25 := [
+		{"position": 1, "handle": "lider", "best_score": 320000, "is_me": false},
+		{"position": 6, "handle": "mateo", "best_score": 215000, "is_me": false},
+		{"position": 7, "handle": "hory", "best_score": 180000, "is_me": true},
+	]
+	var rival_target: Dictionary = COMPETITIVE_TARGET.from_snapshot(top25, true, 1000)
+	assert(rival_target["mode"] == "rival" and rival_target["name"] == "@mateo" and not rival_target["target_is_leader"], "a Top 25 player should target the immediately superior player")
+	assert(not rival_target.has("email"), "the competitive target model must retain only public handle and score fields")
+	var second_place := [
+		{"position": 1, "handle": "lider", "best_score": 320000, "is_me": false},
+		{"position": 2, "handle": "hory", "best_score": 215000, "is_me": true},
+	]
+	var leader_target: Dictionary = COMPETITIVE_TARGET.from_snapshot(second_place, true, 1000)
+	assert(COMPETITIVE_TARGET.completion_message(leader_target) == "NUEVO #1 PROVISIONAL", "passing the leader should be provisional until server submission")
+	var rows := []
+	for rank in range(1, 26):
+		rows.append({"position": rank, "handle": "p" + str(rank), "best_score": 200000 - rank * 1000, "is_me": rank == 25})
+	var cutoff_target: Dictionary = COMPETITIVE_TARGET.from_snapshot(rows, true, 0)
+	assert(cutoff_target["mode"] == "rival" and cutoff_target["position"] == 24, "a player at #25 should target #24")
+	var outside_rows := rows.duplicate(true)
+	outside_rows[24]["is_me"] = false
+	outside_rows.append({"position": 42, "handle": "hory", "best_score": 10000, "is_me": true})
+	var outside_target: Dictionary = COMPETITIVE_TARGET.from_snapshot(outside_rows, true, 0)
+	assert(outside_target["mode"] == "top25" and outside_target["position"] == 25 and outside_target["name"] == "PUESTO #25", "a player outside the Top 25 should target the #25 cutoff")
+	assert(outside_target["player_position"] == 42, "an outside player position should come from the same snapshot")
+	assert(COMPETITIVE_TARGET.completion_message(outside_target) == "¡TOP 25 PROVISIONAL!", "entering the Top 25 should be provisional")
+	var first_place := [{"position": 1, "handle": "hory", "best_score": 320000, "is_me": true}]
+	var record_target: Dictionary = COMPETITIVE_TARGET.from_snapshot(first_place, true, 350000)
+	assert(record_target["mode"] == "weekly_record" and record_target["target_score"] == 320001, "the current #1 should target a new weekly personal record")
+	assert(COMPETITIVE_TARGET.is_reached(record_target, 320001), "reaching the weekly record target should trigger completion")
+	var empty_target: Dictionary = COMPETITIVE_TARGET.from_snapshot([], true, 76000)
+	var offline_target: Dictionary = COMPETITIVE_TARGET.from_snapshot([], false, 76000)
+	assert(empty_target["mode"] == "local_record" and empty_target["target_score"] == 76001, "an empty weekly ranking should fall back to the local record")
+	assert(offline_target["mode"] == "local_record" and offline_target["target_score"] == 76001, "network failure should use the same non-blocking local fallback")
+	assert(COMPETITIVE_TARGET.remaining(offline_target, 41801) == 34200, "local target completion math should remain correct without a difference readout")
